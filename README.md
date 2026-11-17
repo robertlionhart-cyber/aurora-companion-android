@@ -15,7 +15,8 @@ This is the Android version of [Aurora Companion (desktop)](https://github.com/r
 
 1. **On your phone or tablet**, open the
    [Releases page](https://github.com/robertlionhart-cyber/aurora-companion-android/releases/latest).
-2. Under **Assets**, tap **`AuroraCompanion-0.8.2-beta.apk`** to download it (about 134 MB).
+2. Under **Assets**, tap the **`AuroraCompanion-….apk`** file to download it (about 134 MB). The Releases link
+   always opens the newest version.
 3. When the download finishes, tap it (or open it from your **Downloads**).
 4. If Android says your browser isn't allowed to install apps, tap **Settings** and turn on
    **Allow from this source** ("Install unknown apps"), then go back and tap **Install**.
@@ -44,7 +45,9 @@ This is the Android version of [Aurora Companion (desktop)](https://github.com/r
 - **Reminders**: "remind me to call Mum at 5pm" by typing or voice, with alarms and notifications
 - **Book library**: 82 public-domain books to read offline, plus an optional "Knowledge from books"
   mode where the companion can quote and cite them
-- **Conversation history**: every chat and call is saved on the device to read back, share as text, or delete
+- **Conversation history**: every chat and call is saved on the device to read back, **continue**, share as text, or delete
+- **Running memory**: after each chat or call the companion writes a few short notes about you (name, likes, plans)
+  and remembers them in new chats. View, edit, add or wipe them on the Memory screen, or turn memory off
 - Works with large system font sizes, on phones and tablets
 
 ## What the app downloads (only when you tap Download)
@@ -65,7 +68,7 @@ agree to by downloading it. Every download is checked against a pinned checksum.
 
 ## Privacy
 
-- Fully offline after the downloads: chats, voice and history never leave your device
+- Fully offline after the downloads: chats, voice, history and memory notes never leave your device
 - No account, no sign-in, no ads, no analytics, no telemetry
 - The only network use is the downloads above, when you tap them
 - Microphone is used only while you are talking to the companion

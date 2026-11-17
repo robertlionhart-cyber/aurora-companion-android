@@ -40,7 +40,7 @@ fun HistoryScreen(ui: UiState, vm: AuroraViewModel, sizing: Sizing, onClose: () 
     open?.let { c ->
         // Keep showing the latest copy (the open one may still be growing if it is the current chat).
         val cur = ui.history.firstOrNull { it.id == c.id } ?: c
-        TranscriptView(cur, ui, vm, sizing, onBack = { open = null })
+        TranscriptView(cur, ui, vm, sizing, onBack = { open = null }, onContinue = { vm.continueConversation(cur); open = null; onClose() })
         return
     }
     androidx.activity.compose.BackHandler(onBack = onClose)
@@ -92,7 +92,7 @@ private fun ConversationRow(c: Conversation, ui: UiState, onClick: () -> Unit) {
 }
 
 @Composable
-private fun TranscriptView(c: Conversation, ui: UiState, vm: AuroraViewModel, sizing: Sizing, onBack: () -> Unit) {
+private fun TranscriptView(c: Conversation, ui: UiState, vm: AuroraViewModel, sizing: Sizing, onBack: () -> Unit, onContinue: () -> Unit) {
     androidx.activity.compose.BackHandler(onBack = onBack)
     val ctx = LocalContext.current
     var confirmDelete by remember { mutableStateOf(false) }
@@ -116,6 +116,7 @@ private fun TranscriptView(c: Conversation, ui: UiState, vm: AuroraViewModel, si
                 TextButton(onClick = onBack) { Text("Back") }
             }
             FlowRow(Modifier.padding(horizontal = sizing.pad, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Button(onClick = onContinue, enabled = ui.loadedModelName != null && !ui.generating) { Text("\u25B6 Continue") }
                 OutlinedButton(onClick = {
                     vm.conversationShareFile(c)?.let { f ->
                         val uri = FileProvider.getUriForFile(ctx, ctx.packageName + ".files", f)

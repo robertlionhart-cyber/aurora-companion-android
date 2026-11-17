@@ -31,6 +31,31 @@ interface InferenceEngine {
     fun sendUserPrompt(message: String, predictLength: Int = DEFAULT_PREDICT_LENGTH): Flow<String>
 
     /**
+     * Rebuilds the context from scratch: system prompt + earlier messages (true = user).
+     * Works in ModelReady, or in Error after a failed prompt (recovery).
+     */
+    suspend fun loadConversation(systemPrompt: String, history: List<Pair<Boolean, String>>)
+
+    /** Number of tokens [text] would take (no special tokens added). */
+    suspend fun countTokens(text: String): Int
+
+    /** Tokens currently held in the context. */
+    suspend fun contextUsed(): Int
+
+    /** Drops the oldest whole turns until at least [needed] tokens are free. Returns tokens freed. */
+    suspend fun trimOldestTurns(needed: Int): Int
+
+    /** Snapshot / restore of the chat context (used around a side task such as writing memory notes). */
+    suspend fun saveChatState(): Boolean
+    suspend fun restoreChatState(): Boolean
+
+    /** The prompt didn't fit even after dropping old turns. */
+    class ContextFullException : IllegalStateException("The message is too long for the model's memory")
+
+    /** llama.cpp failed while processing; the context must be rebuilt. */
+    class PromptFailedException(msg: String) : IllegalStateException(msg)
+
+    /**
      * Runs a benchmark with the specified parameters.
      */
     suspend fun bench(pp: Int, tg: Int, pl: Int, nr: Int = 1): String
@@ -68,6 +93,7 @@ interface InferenceEngine {
 
     companion object {
         const val DEFAULT_PREDICT_LENGTH = 1024
+        const val CONTEXT_SIZE = 4096
     }
 }
 

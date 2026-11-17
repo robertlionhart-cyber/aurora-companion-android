@@ -106,6 +106,20 @@ internal class InferenceEngineImpl private constructor(
     @FastNative
     private external fun unload()
 
+    // Aurora 0.8.3: turn-aware context management (see ai_chat.cpp)
+    private external fun loadHistory(systemPrompt: String, roles: Array<String>, texts: Array<String>): Int
+    private external fun tokenCount(text: String): Int
+    private external fun contextPos(): Int
+    private external fun trimOldest(needed: Int): Int
+    private external fun finishAssistant()
+    private external fun genError(): Int
+    private external fun saveState(): Int
+    private external fun restoreState(): Int
+
+    /** True while a model is loaded (also in an Error state caused by a failed prompt). */
+    @Volatile
+    private var _modelLoaded = false
+
     @FastNative
     private external fun shutdown()
 
@@ -173,6 +187,7 @@ internal class InferenceEngineImpl private constructor(
                 }
                 Log.i(TAG, "Model loaded!")
                 _readyForSystemPrompt = true
+                _modelLoaded = true
 
                 _cancelGeneration = false
                 _state.value = InferenceEngine.State.ModelReady
@@ -222,6 +237,7 @@ internal class InferenceEngineImpl private constructor(
         check(_state.value is InferenceEngine.State.ModelReady) {
             "User prompt discarded due to: ${_state.value.javaClass.simpleName}"
         }
+        _cancelGeneration = false
 
         try {
             Log.i(TAG, "Sending user prompt...")
@@ -231,7 +247,12 @@ internal class InferenceEngineImpl private constructor(
             processUserPrompt(message, predictLength).let { result ->
                 if (result != 0) {
                     Log.e(TAG, "Failed to process user prompt: $result")
-                    return@flow
+                    if (result == 3) {
+                        // Didn't fit: nothing was decoded, the context is still consistent.
+                        _state.value = InferenceEngine.State.ModelReady
+                        throw InferenceEngine.ContextFullException()
+                    }
+                    throw InferenceEngine.PromptFailedException("Failed to process user prompt: $result")
                 }
             }
 
@@ -242,6 +263,9 @@ internal class InferenceEngineImpl private constructor(
                     if (utf8token.isNotEmpty()) emit(utf8token)
                 } ?: break
             }
+            finishAssistant()
+            val err = genError()
+            if (err != 0) throw InferenceEngine.PromptFailedException("Decoding failed during the reply: $err")
             if (_cancelGeneration) {
                 Log.i(TAG, "Assistant generation aborted per requested.")
             } else {
@@ -250,6 +274,10 @@ internal class InferenceEngineImpl private constructor(
             _state.value = InferenceEngine.State.ModelReady
         } catch (e: CancellationException) {
             Log.i(TAG, "Assistant generation's flow collection cancelled.")
+            runCatching { finishAssistant() }
+            _state.value = InferenceEngine.State.ModelReady
+            throw e
+        } catch (e: InferenceEngine.ContextFullException) {
             _state.value = InferenceEngine.State.ModelReady
             throw e
         } catch (e: Exception) {
@@ -288,6 +316,7 @@ internal class InferenceEngineImpl private constructor(
                     _state.value = InferenceEngine.State.UnloadingModel
 
                     unload()
+                    _modelLoaded = false
 
                     _state.value = InferenceEngine.State.Initialized
                     Log.i(TAG, "Model unloaded!")
@@ -296,6 +325,7 @@ internal class InferenceEngineImpl private constructor(
 
                 is InferenceEngine.State.Error -> {
                     Log.i(TAG, "Resetting error states...")
+                    if (_modelLoaded) { unload(); _modelLoaded = false }
                     _state.value = InferenceEngine.State.Initialized
                     Log.i(TAG, "States reset!")
                     Unit
@@ -304,6 +334,55 @@ internal class InferenceEngineImpl private constructor(
                 else -> throw IllegalStateException("Cannot unload model in ${state.javaClass.simpleName}")
             }
         }
+    }
+
+    private fun checkChatReady(what: String) {
+        val st = _state.value
+        check(st is InferenceEngine.State.ModelReady || (st is InferenceEngine.State.Error && _modelLoaded)) {
+            "$what discarded due to: ${st.javaClass.simpleName}"
+        }
+    }
+
+    override suspend fun loadConversation(systemPrompt: String, history: List<Pair<Boolean, String>>) =
+        withContext(llamaDispatcher) {
+            require(systemPrompt.isNotBlank()) { "Cannot process empty system prompt!" }
+            checkChatReady("Conversation load")
+            _readyForSystemPrompt = false
+            _cancelGeneration = false
+            _state.value = InferenceEngine.State.ProcessingSystemPrompt
+            val roles = history.map { if (it.first) "user" else "assistant" }.toTypedArray()
+            val texts = history.map { it.second }.toTypedArray()
+            val rc = loadHistory(systemPrompt, roles, texts)
+            if (rc != 0) {
+                val e = RuntimeException("Failed to load the conversation: $rc")
+                _state.value = InferenceEngine.State.Error(e)
+                throw e
+            }
+            _state.value = InferenceEngine.State.ModelReady
+        }
+
+    override suspend fun countTokens(text: String): Int = withContext(llamaDispatcher) {
+        if (!_modelLoaded) text.length / 3 else tokenCount(text)
+    }
+
+    override suspend fun contextUsed(): Int = withContext(llamaDispatcher) { if (_modelLoaded) contextPos() else 0 }
+
+    override suspend fun trimOldestTurns(needed: Int): Int = withContext(llamaDispatcher) {
+        checkChatReady("Trim")
+        trimOldest(needed)
+    }
+
+    override suspend fun saveChatState(): Boolean = withContext(llamaDispatcher) {
+        _modelLoaded && _state.value is InferenceEngine.State.ModelReady && saveState() == 0
+    }
+
+    override suspend fun restoreChatState(): Boolean = withContext(llamaDispatcher) {
+        if (!_modelLoaded) return@withContext false
+        val st = _state.value
+        if (st !is InferenceEngine.State.ModelReady && st !is InferenceEngine.State.Error) return@withContext false
+        val ok = restoreState() == 0
+        if (ok) _state.value = InferenceEngine.State.ModelReady
+        ok
     }
 
     /**

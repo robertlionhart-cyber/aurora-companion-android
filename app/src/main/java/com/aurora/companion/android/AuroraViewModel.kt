@@ -19,7 +19,11 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
@@ -27,7 +31,8 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.UUID
 
-data class ChatMessage(val id: String = UUID.randomUUID().toString(), val text: String, val isUser: Boolean, val time: Long = System.currentTimeMillis())
+/** aside = written by the app (e.g. a friendly error), never sent back to the model. */
+data class ChatMessage(val id: String = UUID.randomUUID().toString(), val text: String, val isUser: Boolean, val time: Long = System.currentTimeMillis(), val aside: Boolean = false)
 
 sealed class Screen {
     object Setup : Screen()
@@ -94,6 +99,13 @@ data class UiState(
     val bookKnowledgeDefault: Boolean = false,
     // 0.8.2: conversation history (review only)
     val history: List<Conversation> = emptyList(),
+    // 0.8.3: running memory + continue
+    val memoryOn: Boolean = true,
+    val memoryNotes: List<MemoryNote> = emptyList(),
+    /** The companion is writing memory notes after a chat (sends wait for it). */
+    val memoryBusy: Boolean = false,
+    /** Short status while the context is being rebuilt (Continue / recovery). */
+    val preparing: String? = null,
 ) {
     val companion: CompanionProfile get() = characters.firstOrNull { it.id == companionId } ?: Companions.byId(companionId)
 }
@@ -132,6 +144,18 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
     private var workJob: Job? = null
     private var genJob: Job? = null
 
+    // ---------- 0.8.3: one model, one user at a time ----------
+    /** Serializes everything that uses the llama context: loading, replies, memory passes, rebuilds. */
+    private val llm = Mutex()
+    /** True when the native context matches the chat on screen (false after a memory pass or an error). */
+    @Volatile private var chatValid = false
+    private var memJob: Job? = null
+    /** Messages before this index were already given to a memory pass. */
+    private var memFrom = 0
+    /** A memory pass that was interrupted (e.g. you started talking); it's retried with the next one. */
+    private var deferredMemory: PendingMemory? = null
+    private data class PendingMemory(val companionId: String, val companionName: String, val lines: List<Pair<Boolean, String>>)
+
     // ---------- voice ----------
     private val voice = VoiceEngine(app)
     private data class Utterance(val text: String, val epoch: Int)
@@ -155,6 +179,7 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
             animateAvatar = prefs.getBoolean("animate_avatar", true),
         ) }
         _ui.update { it.copy(bargeIn = prefs.getBoolean("barge_in", true), bargeSensitivity = prefs.getString("barge_sens", "medium") ?: "medium") }
+        _ui.update { it.copy(memoryOn = prefs.getBoolean("memory_on", true)) }
         val savedSpeaker = speakerPrefFor(_ui.value.companionId)
         voice.speakerId = savedSpeaker
         _ui.update {
@@ -366,22 +391,42 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun loadModel(file: File) {
+    /**
+     * Loads the model with the companion's persona (+ memory). With [resume], the saved messages are put back on
+     * screen and into the model's context instead of a fresh greeting (Continue from History).
+     */
+    private fun loadModel(file: File, resume: List<ChatMessage>? = null) {
         workJob = viewModelScope.launch {
             val comp = _ui.value.companion
             _ui.update { it.copy(screen = Screen.Busy("Waking up ${comp.name}...", null, "Loading ${file.name} into memory")) }
             try {
-                val st = engine.state.first { it is InferenceEngine.State.Initialized || it.isModelReadyish() || it is InferenceEngine.State.Error }
-                if (st !is InferenceEngine.State.Initialized) engine.cleanUp()
-                engine.loadModel(file.path)
-                engine.setSystemPrompt(comp.systemPrompt())
-                prefs.edit().putString("last_model_file", file.name).apply()
-                saveConversation()
-                _ui.update {
-                    it.copy(screen = Screen.Chat, loadedModelName = file.name,
-                        messages = listOf(ChatMessage(text = comp.greeting, isUser = false)))
+                llm.withLock {
+                    chatValid = false
+                    val st = withTimeoutOrNull(30_000) {
+                        engine.state.first { it is InferenceEngine.State.Initialized || it.isModelReadyish() || it is InferenceEngine.State.Error }
+                    } ?: throw IllegalStateException("The AI engine is busy (${engine.state.value.javaClass.simpleName})")
+                    if (st !is InferenceEngine.State.Initialized) engine.cleanUp()
+                    engine.loadModel(file.path)
+                    val sys = fullSystemPrompt(comp)
+                    if (resume == null) engine.setSystemPrompt(sys)
+                    else engine.loadConversation(sys, contextTurns(resume, REBUILD_TOKEN_BUDGET))
+                    chatValid = true
                 }
-                beginConversation(HistoryStore.MODE_CHAT, 0)
+                prefs.edit().putString("last_model_file", file.name).apply()
+                if (resume == null) {
+                    saveConversation()
+                    _ui.update {
+                        it.copy(screen = Screen.Chat, loadedModelName = file.name,
+                            messages = listOf(ChatMessage(text = comp.greeting, isUser = false)))
+                    }
+                    memFrom = 0
+                    beginConversation(HistoryStore.MODE_CHAT, 0)
+                } else {
+                    _ui.update { it.copy(screen = Screen.Chat, loadedModelName = file.name, messages = resume) }
+                    memFrom = resume.size
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Throwable) {
                 Log.e(TAG, "load failed", e)
                 runCatching { engine.cleanUp() }
@@ -390,48 +435,169 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** The persona plus the compact running-memory block (about 300 tokens at most). */
+    private fun fullSystemPrompt(comp: CompanionProfile): String {
+        val base = comp.systemPrompt()
+        if (!_ui.value.memoryOn) return base
+        val notes = runCatching { MemoryStore.load(getApplication(), comp.id) }.getOrDefault(emptyList())
+        return base + MemoryStore.promptBlock(notes)
+    }
+
+    /** The newest messages that fit in [budget] tokens, oldest first, for rebuilding the context. */
+    private suspend fun contextTurns(msgs: List<ChatMessage>, budget: Int): List<Pair<Boolean, String>> {
+        val usable = msgs.filter { !it.aside && it.text.isNotBlank() && it.text != NO_REPLY }
+        val picked = ArrayList<Pair<Boolean, String>>()
+        var used = 0
+        for (m in usable.asReversed()) {
+            val t = m.text.take(MAX_PROMPT_CHARS)
+            val cost = engine.countTokens(t) + 8
+            if (used + cost > budget) break
+            picked += m.isUser to t
+            used += cost
+        }
+        picked.reverse()
+        // Start on a user turn when possible (a leading greeting is fine, a dangling reply fragment isn't useful).
+        while (picked.size > 1 && !picked.first().first && !picked[1].first) picked.removeAt(0)
+        return picked
+    }
+
+    /** Rebuilds the model's context from [msgs] (the chat on screen, without the message being answered). */
+    private suspend fun rebuildChat(msgs: List<ChatMessage>) {
+        chatValid = false
+        engine.loadConversation(fullSystemPrompt(_ui.value.companion), contextTurns(msgs, REBUILD_TOKEN_BUDGET))
+        chatValid = true
+    }
+
+    /** Last resort: reload the model file (keeps the chat on screen). */
+    private suspend fun reloadModelKeepingChat(msgs: List<ChatMessage>) {
+        val name = _ui.value.loadedModelName ?: throw IllegalStateException("No model loaded")
+        chatValid = false
+        runCatching { engine.cleanUp() }
+        engine.loadModel(File(modelsDir, name).path)
+        engine.loadConversation(fullSystemPrompt(_ui.value.companion), contextTurns(msgs, REBUILD_TOKEN_BUDGET))
+        chatValid = true
+    }
+
+    private suspend fun awaitEngineReady(): Boolean = withTimeoutOrNull(10_000) {
+        engine.state.first { it is InferenceEngine.State.ModelReady || it is InferenceEngine.State.Error }
+    } != null
+
     private fun InferenceEngine.State.isModelReadyish() =
         this is InferenceEngine.State.ModelReady
 
     fun send(text: String) {
         val msg = text.trim()
         if (msg.isEmpty() || _ui.value.generating || _ui.value.screen != Screen.Chat) return
+        // You come first: an unfinished memory pass is paused and retried later.
+        memJob?.let { if (it.isActive) it.cancel() }
+        val userMsg = ChatMessage(text = msg, isUser = true)
         val reply = ChatMessage(text = "", isUser = false)
-        _ui.update { it.copy(messages = it.messages + ChatMessage(text = msg, isUser = true) + reply, generating = true) }
+        _ui.update { it.copy(messages = it.messages + userMsg + reply, generating = true) }
         // Reminders by chat / voice (desktop: try_complete / try_parse_reminder_command / user_asks_schedule).
         // The llama.cpp system prompt is fixed after load, so the app's note rides along with this one user turn.
         val note = runCatching { reminderChat(msg) }.getOrNull()
         val useBooks = note == null && _ui.value.bookKnowledge && _ui.value.libraryTask == null && _ui.value.library.indexedBooks > 0
         genJob = viewModelScope.launch {
-            // Book library (0.8): up to 3 short passages (~1,200 chars) ride along in the same hidden note.
-            val books = if (!useBooks) null else withContext(Dispatchers.IO) {
-                runCatching { Library.retrieveForChat(getApplication(), msg, BOOK_NOTE_BUDGET) }
-                    .onFailure { Log.e(TAG, "book retrieval failed", it) }.getOrNull()
-            }
-            if (books != null) _ui.update { it.copy(notice = "\uD83D\uDCDA From the library: " + books.second.joinToString(", ")) }
-            val hidden = note ?: books?.first
-            val prompt = if (hidden != null) "(App note, not said by the user: $hidden)\n\n$msg" else msg
             val sb = StringBuilder()
             val splitter = SentenceSplitter()
             val speakEpoch = voice.currentEpoch()
             try {
+                // Book library (0.8): up to 3 short passages (~1,200 chars) ride along in the same hidden note.
+                val books = if (!useBooks) null else withContext(Dispatchers.IO) {
+                    runCatching { Library.retrieveForChat(getApplication(), msg, BOOK_NOTE_BUDGET) }
+                        .onFailure { Log.e(TAG, "book retrieval failed", it) }.getOrNull()
+                }
+                if (books != null) _ui.update { it.copy(notice = "\uD83D\uDCDA From the library: " + books.second.joinToString(", ")) }
+                val hidden = note ?: books?.first
+                val prompt = (if (hidden != null) "(App note, not said by the user: $hidden)\n\n$msg" else msg).take(MAX_PROMPT_CHARS)
+                llm.withLock { runTurn(prompt, userMsg.id, reply.id, sb, splitter, speakEpoch) }
+            } finally {
+                if ((_ui.value.autoSpeak || _ui.value.inCall) && speakEpoch == voice.currentEpoch()) splitter.flush()?.let { enqueueSpeech(it, speakEpoch) }
+                if (sb.isEmpty()) _ui.update { s -> s.copy(messages = s.messages.map { if (it.id == reply.id && it.text.isEmpty()) it.copy(text = NO_REPLY, aside = true) else it }) }
+                _ui.update { it.copy(generating = false, preparing = null) }
+                saveConversation()
+            }
+        }
+    }
+
+    /** Messages that are already in (or belong in) the model's context: everything before [userMsgId]. */
+    private fun historyBefore(userMsgId: String): List<ChatMessage> {
+        val m = _ui.value.messages
+        val i = m.indexOfFirst { it.id == userMsgId }
+        return if (i < 0) m else m.subList(0, i).toList()
+    }
+
+    /**
+     * One reply, robustly (0.8.3):
+     * - the prompt + reply always fit the 4,096-token context: old whole turns are dropped first;
+     * - if llama.cpp fails, the context is rebuilt (or the model reloaded) and the turn retried once;
+     * - if it still fails, a friendly message replaces the raw error.
+     */
+    private suspend fun runTurn(prompt: String, userMsgId: String, replyId: String, sb: StringBuilder, splitter: SentenceSplitter, speakEpoch: Int) {
+        var attempt = 0
+        while (true) {
+            try {
+                if (!awaitEngineReady()) throw IllegalStateException("engine busy: ${engine.state.value.javaClass.simpleName}")
+                if (!chatValid) {
+                    _ui.update { it.copy(preparing = "Getting ready...") }
+                    rebuildChat(historyBefore(userMsgId))
+                    _ui.update { it.copy(preparing = null) }
+                }
+                makeRoom(prompt)
                 engine.sendUserPrompt(prompt, MAX_REPLY_TOKENS).collect { token ->
                     sb.append(token)
                     if (_ui.value.autoSpeak || _ui.value.inCall) splitter.push(token).forEach { enqueueSpeech(it, speakEpoch) }
                     val t = sb.toString()
-                    _ui.update { s -> s.copy(messages = s.messages.map { if (it.id == reply.id) it.copy(text = t) else it }) }
+                    _ui.update { s -> s.copy(messages = s.messages.map { if (it.id == replyId) it.copy(text = t) else it }) }
                 }
-            } catch (e: Exception) {
-                if (e !is kotlinx.coroutines.CancellationException) {
-                    _ui.update { it.copy(error = "Generation error: ${e.message}") }
+                return
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Log.e(TAG, "reply failed (attempt ${attempt + 1}): ${e.javaClass.simpleName}: ${e.message}", e)
+                chatValid = false
+                val tooLong = e is InferenceEngine.ContextFullException
+                if (attempt == 0 && sb.isEmpty() && !tooLong) {
+                    attempt++
+                    _ui.update { it.copy(preparing = "One moment...") }
+                    try {
+                        try { rebuildChat(historyBefore(userMsgId)) }
+                        catch (r: kotlinx.coroutines.CancellationException) { throw r }
+                        catch (r: Throwable) {
+                            Log.e(TAG, "context rebuild failed, reloading the model", r)
+                            reloadModelKeepingChat(historyBefore(userMsgId))
+                        }
+                        continue
+                    } catch (r: kotlinx.coroutines.CancellationException) {
+                        throw r
+                    } catch (r: Throwable) {
+                        Log.e(TAG, "recovery failed", r)
+                    } finally {
+                        _ui.update { it.copy(preparing = null) }
+                    }
                 }
-            } finally {
-                if ((_ui.value.autoSpeak || _ui.value.inCall) && speakEpoch == voice.currentEpoch()) splitter.flush()?.let { enqueueSpeech(it, speakEpoch) }
-                if (sb.isEmpty()) _ui.update { s -> s.copy(messages = s.messages.map { if (it.id == reply.id) it.copy(text = "(no reply)") else it }) }
-                _ui.update { it.copy(generating = false) }
-                saveConversation()
+                val friendly = if (tooLong) "That one's a bit too long for me to take in at once. Could you say it in a shorter way?"
+                    else "Sorry, I lost my train of thought for a second. Could you say that again?"
+                if (sb.isEmpty()) {
+                    _ui.update { s -> s.copy(messages = s.messages.map { if (it.id == replyId) it.copy(text = friendly, aside = true) else it }) }
+                    if (_ui.value.autoSpeak || _ui.value.inCall) enqueueSpeech(friendly, speakEpoch)
+                    sb.append(friendly)
+                }
+                return
             }
         }
+    }
+
+    /** Drops the oldest whole turns if the prompt plus a full reply wouldn't fit in the context. */
+    private suspend fun makeRoom(prompt: String) {
+        val need = engine.countTokens(prompt) + 24
+        val limit = InferenceEngine.CONTEXT_SIZE - MAX_REPLY_TOKENS - 64
+        val used = engine.contextUsed()
+        if (used + need > limit) {
+            val freed = engine.trimOldestTurns(used + need - limit + TRIM_SLACK_TOKENS)
+            Log.i(TAG, "context: used $used + prompt $need > $limit, dropped $freed tokens of old turns")
+        }
+        if (engine.contextUsed() + need > InferenceEngine.CONTEXT_SIZE - 64) throw InferenceEngine.ContextFullException()
     }
 
     fun stop() { genJob?.cancel() }
@@ -546,6 +712,7 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update { it.copy(inCall = false, callMuted = false, callHearing = false, callLevel = 0f) }
         saveConversation()
         beginConversation(HistoryStore.MODE_CHAT, _ui.value.messages.size)
+        queueMemory(capturePendingMemory())   // after each call, the companion writes its memory notes
     }
 
     // ---------- conversation history (0.8.2) ----------
@@ -572,6 +739,173 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         val ctx = getApplication<Application>()
         val work = { runCatching { HistoryStore.save(ctx, c) }.onFailure { Log.e(TAG, "history save failed", it) }; Unit }
         if (sync) work() else viewModelScope.launch(Dispatchers.IO) { work() }
+    }
+
+    // ---------- 0.8.3: Continue a saved conversation ----------
+    fun continueConversation(c: Conversation) {
+        val st = _ui.value
+        val modelName = st.loadedModelName
+        if (modelName == null) { _ui.update { it.copy(error = "Load a chat model first, then continue the conversation.") }; return }
+        if (st.inCall) endCall()
+        stop()
+        stopSpeaking()
+        val pending = capturePendingMemory()
+        saveConversation()
+        val msgs = c.messages.filter { it.text.isNotBlank() }.map { ChatMessage(text = it.text, isUser = it.user, time = it.time) }
+        val switching = c.companionId != st.companionId && (st.characters.any { it.id == c.companionId } || Companions.byId(c.companionId).id == c.companionId)
+        if (switching) applyCompanion(c.companionId)
+        // Keep appending to the same saved conversation.
+        convId = c.id; convMode = c.mode; convStart = c.start; convFrom = 0
+        convCompanion = _ui.value.companion
+        memFrom = msgs.size
+        if (switching) {
+            loadModel(File(modelsDir, modelName), resume = msgs)
+        } else {
+            _ui.update { it.copy(messages = msgs, preparing = "Picking up where you left off...") }
+            workJob = viewModelScope.launch {
+                try {
+                    llm.withLock {
+                        if (!awaitEngineReady()) throw IllegalStateException("engine busy")
+                        try { rebuildChat(msgs) } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                        catch (e: Throwable) { Log.e(TAG, "continue: rebuild failed, reloading", e); reloadModelKeepingChat(msgs) }
+                    }
+                } catch (e: kotlinx.coroutines.CancellationException) { throw e
+                } catch (e: Throwable) {
+                    Log.e(TAG, "continue failed", e)
+                    chatValid = false
+                } finally { _ui.update { it.copy(preparing = null) } }
+            }
+        }
+        _ui.update { it.copy(notice = "Picked up your conversation with ${c.companionName}") }
+        queueMemory(pending)
+    }
+
+    // ---------- 0.8.3: running memory ----------
+    /** Takes the messages not yet given to a memory pass (needs at least 2 things you said). */
+    private fun capturePendingMemory(): PendingMemory? {
+        val st = _ui.value
+        val msgs = st.messages.drop(memFrom).filter { !it.aside && it.text.isNotBlank() && it.text != NO_REPLY }
+        memFrom = st.messages.size
+        if (!st.memoryOn) return null
+        val comp = convCompanion ?: st.companion
+        var lines = msgs.map { it.isUser to it.text }
+        val prev = deferredMemory
+        if (prev != null && prev.companionId == comp.id) { lines = prev.lines + lines; deferredMemory = null }
+        if (lines.count { it.first } < 2) {
+            if (lines.isNotEmpty()) deferredMemory = PendingMemory(comp.id, comp.name, lines.takeLast(MEMORY_MAX_LINES))
+            return null
+        }
+        return PendingMemory(comp.id, comp.name, lines.takeLast(MEMORY_MAX_LINES))
+    }
+
+    private fun queueMemory(p: PendingMemory?) {
+        if (p == null) return
+        val prevJob = memJob
+        val load = workJob
+        memJob = viewModelScope.launch {
+            load?.join()
+            prevJob?.join()
+            writeMemoryNotes(p)
+        }
+    }
+
+    /** The model reads the chat and writes short notes; the chat context is saved and restored around it. */
+    private suspend fun writeMemoryNotes(p: PendingMemory) {
+        if (_ui.value.loadedModelName == null) { deferredMemory = p; return }
+        llm.withLock {
+            _ui.update { it.copy(memoryBusy = true) }
+            var saved = false
+            try {
+                if (!awaitEngineReady()) { deferredMemory = p; return@withLock }
+                saved = chatValid && engine.saveChatState()
+                chatValid = false
+                val known = withContext(Dispatchers.IO) { MemoryStore.load(getApplication(), p.companionId) }
+                engine.loadConversation(MemoryStore.EXTRACT_SYSTEM, emptyList())
+                var lines = p.lines
+                var prompt = MemoryStore.extractPrompt(p.companionName, lines, known)
+                while (lines.size > 2 && engine.countTokens(prompt) > MEMORY_PROMPT_TOKENS) {
+                    lines = lines.drop(2)
+                    prompt = MemoryStore.extractPrompt(p.companionName, lines, known)
+                }
+                val out = StringBuilder()
+                engine.sendUserPrompt(prompt, MEMORY_REPLY_TOKENS).collect { out.append(it) }
+                val (facts, summary) = MemoryStore.parse(out.toString())
+                Log.i(TAG, "memory pass for ${p.companionId}: ${facts.size} facts, summary=${summary != null}")
+                val added = withContext(Dispatchers.IO) { MemoryStore.merge(getApplication(), p.companionId, facts, summary) }
+                if (p.companionId == _ui.value.companionId) refreshMemoryNotes()
+                if (added > 0) Log.i(TAG, "memory: $added new notes")
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                deferredMemory = p
+                throw e
+            } catch (e: Throwable) {
+                Log.e(TAG, "memory pass failed", e)
+            } finally {
+                withContext(NonCancellable) {
+                    if (saved && runCatching { engine.restoreChatState() }.getOrDefault(false)) chatValid = true
+                    _ui.update { it.copy(memoryBusy = false) }
+                }
+            }
+        }
+    }
+
+    /** Called when the app goes to the background: a good quiet moment for a memory pass. */
+    fun onAppBackground() {
+        val st = _ui.value
+        if (st.screen != Screen.Chat || st.generating || st.inCall || st.loadedModelName == null) return
+        queueMemory(capturePendingMemory())
+    }
+
+    fun refreshMemoryNotes() {
+        val id = _ui.value.companionId
+        viewModelScope.launch(Dispatchers.IO) {
+            val notes = MemoryStore.load(getApplication(), id)
+            _ui.update { it.copy(memoryNotes = notes) }
+        }
+    }
+
+    fun setMemoryOn(on: Boolean) {
+        prefs.edit().putBoolean("memory_on", on).apply()
+        _ui.update { it.copy(memoryOn = on) }
+        if (!on) deferredMemory = null
+    }
+
+    fun addMemoryNote(text: String) {
+        val t = text.trim().take(300)
+        if (t.isEmpty()) return
+        val id = _ui.value.companionId
+        viewModelScope.launch(Dispatchers.IO) {
+            val notes = MemoryStore.update(getApplication(), id) { it.add(MemoryNote(text = t, kind = KIND_MANUAL)) }
+            _ui.update { it.copy(memoryNotes = notes) }
+        }
+    }
+
+    fun editMemoryNote(noteId: String, text: String) {
+        val t = text.trim().take(300)
+        val id = _ui.value.companionId
+        viewModelScope.launch(Dispatchers.IO) {
+            val notes = MemoryStore.update(getApplication(), id) { list ->
+                val i = list.indexOfFirst { it.id == noteId }
+                if (i >= 0) { if (t.isEmpty()) list.removeAt(i) else list[i] = list[i].copy(text = t, updated = System.currentTimeMillis()) }
+            }
+            _ui.update { it.copy(memoryNotes = notes) }
+        }
+    }
+
+    fun deleteMemoryNote(noteId: String) {
+        val id = _ui.value.companionId
+        viewModelScope.launch(Dispatchers.IO) {
+            val notes = MemoryStore.update(getApplication(), id) { list -> list.removeAll { it.id == noteId } }
+            _ui.update { it.copy(memoryNotes = notes) }
+        }
+    }
+
+    fun wipeMemory() {
+        val id = _ui.value.companionId
+        deferredMemory = null
+        viewModelScope.launch(Dispatchers.IO) {
+            MemoryStore.wipe(getApplication(), id)
+            _ui.update { it.copy(memoryNotes = emptyList(), notice = "Memory cleared") }
+        }
     }
 
     fun loadHistory() {
@@ -678,11 +1012,24 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
      * so switching reloads the model and starts a fresh chat. Also applies that companion's saved voice.
      */
     fun selectCompanion(id: String) {
+        if (!applyCompanion(id)) return
+        val pending = pendingAutoLoad
+        if (pending != null) { pendingAutoLoad = null; loadModel(pending); return }
+        if (_ui.value.screen == Screen.Chat) {
+            stop()
+            val memPending = capturePendingMemory()
+            _ui.value.loadedModelName?.let { loadModel(File(modelsDir, it)) }
+            queueMemory(memPending)
+        }
+    }
+
+    /** Makes [id] the current companion (prefs + its voice). Returns true if it changed. Doesn't reload the model. */
+    private fun applyCompanion(id: String): Boolean {
         val c = Companions.byId(id)
         val changed = c.id != _ui.value.companionId || !_ui.value.companionChosen
         prefs.edit().putString("companion_id", c.id).apply()
-        _ui.update { it.copy(companionId = c.id, companionChosen = true) }
-        if (!changed) return
+        _ui.update { it.copy(companionId = c.id, companionChosen = true, memoryNotes = emptyList()) }
+        if (!changed) return false
         if (_ui.value.inCall) endCall()
         stopSpeaking()
         // Per-companion voice (Robert's voice unless changed in Settings while this companion is selected).
@@ -691,12 +1038,7 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         voice.speakerId = sp
         _ui.update { it.copy(speakerId = sp) }
         if (wantVoice.id != _ui.value.voiceId && VoiceCatalog.isInstalled(getApplication(), wantVoice) && _ui.value.voiceReady) selectVoice(wantVoice.id)
-        val pending = pendingAutoLoad
-        if (pending != null) { pendingAutoLoad = null; loadModel(pending); return }
-        if (_ui.value.screen == Screen.Chat) {
-            stop()
-            _ui.value.loadedModelName?.let { loadModel(File(modelsDir, it)) }
-        }
+        return true
     }
 
     // ---------- custom characters (0.6) ----------
@@ -796,6 +1138,7 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         prefs.edit().remove("voice_for_$id").remove("speaker_for_$id").apply()
         val wasCurrent = _ui.value.companionId == id
         refreshCharacters()
+        runCatching { MemoryStore.wipe(getApplication(), id) }
         _ui.update { it.copy(editor = null, notice = "Deleted ${c.name}") }
         if (wasCurrent) selectCompanion(Companions.look(c.look).id)
     }
@@ -1181,12 +1524,18 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
     fun newChat() {
         stop()
         stopSpeaking()
+        val pending = capturePendingMemory()
         _ui.value.loadedModelName?.let { loadModel(File(modelsDir, it)) }
+        queueMemory(pending)
     }
 
     fun backToSetup() {
         stop()
         stopSpeaking()
+        // No model to write notes with after this; keep them for the next pass.
+        capturePendingMemory()?.let { deferredMemory = it }
+        memJob?.cancel()
+        chatValid = false
         runCatching { engine.cleanUp() }
         refreshDevice()
         saveConversation()
@@ -1202,6 +1551,7 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         runCatching { saveConversation(sync = true) }
+        memJob?.cancel()
         runCatching { call.release() }
         runCatching { voice.release() }
         speechQueue.close()
@@ -1212,6 +1562,15 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
     companion object {
         private const val TAG = "AuroraVM"
         private const val MAX_REPLY_TOKENS = 384
+        /** Context rebuilds (Continue, recovery, after a memory pass) keep about this many tokens of recent chat. */
+        private const val REBUILD_TOKEN_BUDGET = 1400
+        /** Extra room freed when old turns are dropped, so it doesn't happen on every message. */
+        private const val TRIM_SLACK_TOKENS = 600
+        private const val MAX_PROMPT_CHARS = 6000
+        private const val MEMORY_MAX_LINES = 40
+        private const val MEMORY_PROMPT_TOKENS = 2200
+        private const val MEMORY_REPLY_TOKENS = 200
+        const val NO_REPLY = "(no reply)"
         const val BOOK_KNOWLEDGE_MIN_RAM_GB = 6.0
         const val BOOK_NOTE_BUDGET = 1200
         const val DEFAULT_LIBRITTS_SPEAKER = 0

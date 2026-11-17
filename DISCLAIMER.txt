@@ -49,7 +49,7 @@ Please read this before installing and using the app.
    This beta is family-friendly. There is no 18+ mode in this version.
 
 5. Your data and your device
-   Chats, conversation history, characters, reminders and downloads are saved
+   Chats, conversation history, memory notes, characters, reminders and downloads are saved
    in the app's private storage on your device. Uninstalling the app deletes
    them. Running AI models uses a lot of processor, memory, storage and
    battery, and can make the device warm. This is beta software, installed

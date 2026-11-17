@@ -84,6 +84,7 @@ fun ChatScreen(ui: UiState, vm: AuroraViewModel, sizing: Sizing) {
     var showReminders by remember { mutableStateOf(false) }
     var showLibrary by remember { mutableStateOf(false) }
     var showHistory by remember { mutableStateOf(false) }
+    var showMemory by remember { mutableStateOf(false) }
     // Android 13+: ask for notifications the first time a reminder is set.
     val notifPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { vm.notifPermissionAsked() }
     LaunchedEffect(ui.askNotifPermission) {
@@ -95,13 +96,15 @@ fun ChatScreen(ui: UiState, vm: AuroraViewModel, sizing: Sizing) {
     if (showReminders) { FullScreen { RemindersScreen(ui, vm, sizing, onClose = { showReminders = false }) }; return }
     if (showLibrary) { FullScreen { LibraryScreen(ui, vm, sizing, onClose = { showLibrary = false }) }; return }
     if (showHistory) { FullScreen { HistoryScreen(ui, vm, sizing, onClose = { showHistory = false }) }; return }
+    if (showMemory) { FullScreen { MemoryScreen(ui, vm, sizing, onClose = { showMemory = false }) }; return }
     if (showSettings) {
         FullScreen {
             SettingsScreen(ui, vm, sizing, onClose = { showSettings = false },
                 onPickCompanion = { showSettings = false; showPicker = true },
                 onReminders = { showSettings = false; showReminders = true },
                 onLibrary = { showSettings = false; showLibrary = true },
-                onHistory = { showSettings = false; showHistory = true })
+                onHistory = { showSettings = false; showHistory = true },
+                onMemory = { showSettings = false; showMemory = true })
         }
         return
     }
@@ -138,6 +141,7 @@ fun ChatScreen(ui: UiState, vm: AuroraViewModel, sizing: Sizing) {
                         GlassButton("\u23F0 Reminders" + ui.reminders.count { it.active }.let { if (it > 0) " ($it)" else "" }) { showReminders = true }
                         GlassButton("\uD83D\uDCDA Library") { showLibrary = true }
                         GlassButton("\uD83D\uDD58 History") { showHistory = true }
+                        GlassButton("\uD83E\uDDE0 Memory") { showMemory = true }
                         GlassButton("New chat", onClick = vm::newChat)
                         GlassButton("\u2699 Settings") { showSettings = true }
                     }
@@ -245,6 +249,10 @@ private fun ChatColumn(ui: UiState, vm: AuroraViewModel, sizing: Sizing, comp: C
         }
         if (ui.speaking && !ui.inCall) {
             Pill("\u25A0  Stop speaking", Glass, AuroraTeal, onClick = vm::stopSpeaking)
+        }
+        val busyNote = ui.preparing ?: if (ui.memoryBusy && !ui.inCall) "\uD83E\uDDE0 ${comp.name} is jotting down memories..." else null
+        if (busyNote != null) {
+            Pill(busyNote, Glass, Color(0xFFCFD8DC), onClick = {})
         }
         if ((ui.listening || ui.transcribing) && !ui.inCall) {
             Column(
@@ -445,7 +453,7 @@ private fun Chevron() = Text("\u203A", fontSize = fixedSp(26f), color = Material
 
 @Composable
 fun SettingsScreen(ui: UiState, vm: AuroraViewModel, sizing: Sizing, onClose: () -> Unit, onPickCompanion: () -> Unit,
-                   onReminders: () -> Unit, onLibrary: () -> Unit, onHistory: () -> Unit) {
+                   onReminders: () -> Unit, onLibrary: () -> Unit, onHistory: () -> Unit, onMemory: () -> Unit) {
     androidx.activity.compose.BackHandler(onBack = onClose)
     var agreed by remember { mutableStateOf(false) }
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
@@ -481,7 +489,8 @@ fun SettingsScreen(ui: UiState, vm: AuroraViewModel, sizing: Sizing, onClose: ()
                     ui.library.anyDownloaded -> "Partly downloaded. Open to continue."
                     else -> "Public-domain books, optional download (about ${ui.library.totalBytes.toNiceSize()})."
                 }, onClick = onLibrary) { Chevron() }
-                SettingRow("\uD83D\uDD58 Conversation history", "Read, share or delete past chats and calls (saved on this phone only).", onClick = onHistory) { Chevron() }
+                SettingRow("\uD83D\uDD58 Conversation history", "Read, continue, share or delete past chats and calls (saved on this phone only).", onClick = onHistory) { Chevron() }
+                SettingRow("\uD83E\uDDE0 Memory", if (ui.memoryOn) "What ${ui.companion.name} remembers about you. View, edit or forget." else "Off: ${ui.companion.name} starts every chat fresh.", onClick = onMemory) { Chevron() }
                 SettingRow("Knowledge from books", "Adds short book passages to questions and names the book. Off by default under 6 GB RAM.") {
                     Switch(checked = ui.bookKnowledge, onCheckedChange = { vm.setBookKnowledge(it) })
                 }

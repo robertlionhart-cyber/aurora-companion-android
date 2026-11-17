@@ -35,8 +35,8 @@ android {
         applicationId = "com.aurora.companion.android"
         minSdk = 26          // Android 8.0+ : covers Xiaomi Pad 5 and Galaxy A54 easily
         targetSdk = 36
-        versionCode = 12
-        versionName = "0.8.2-beta"
+        versionCode = 13
+        versionName = "0.8.3-beta"
 
         ndk {
             // Pad 5 (Snapdragon 860) and Galaxy A54 (Exynos 1380) are both 64-bit ARM.
