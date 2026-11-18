@@ -58,6 +58,14 @@ Your chats, characters and downloads are kept. (Older versions: install the new 
 - **Reminders**: "remind me to call Mum at 5pm" by typing or voice, with alarms and notifications
 - **Book library**: 82 public-domain books to read offline, plus an optional "Knowledge from books"
   mode where the companion can quote and cite them
+- **Read aloud (new in 1.0)**: tap **Read this to me** on any Library book, or ask in chat ("read me Peter Pan",
+  "keep reading", "stop reading"), and your companion reads it in its own voice, chapter by chapter, with the talking
+  animation. Big, simple controls made for kids: play/pause, back/forward (tap = a sentence, hold = a paragraph),
+  chapters, speed and a **bedtime timer** (15/30/45/60 minutes or end of chapter). Keeps going with the screen off,
+  with lock-screen and headphone controls, pauses for calls, and remembers your place in every book
+- **Find a book (new in 1.0)**: search Project Gutenberg's free public-domain books (via Gutendex, no account) and add
+  them to your Library. Needs Online mode; added books work offline. The Family edition hides books whose subjects
+  are adult or erotic
 - **Conversation history**: every chat and call is saved on the device to read back, **continue**, share as text, or delete
 - **Running memory**: after each chat or call the companion writes a few short notes about you (name, likes, plans)
   and remembers them in new chats. View, edit, add or wipe them on the Memory screen, or turn memory off
@@ -76,6 +84,7 @@ else is optional and downloaded inside the app, straight from its original sourc
 | Avatar packs (Aurora, extra animations, Scott, Globe) | 0.1-1 MB each | this repo's [`avatars-v1` release](https://github.com/robertlionhart-cyber/aurora-companion-android/releases/tag/avatars-v1) | see Avatars below |
 | LibriTTS-R voice (904 speakers) | 75 MB | Hugging Face (rhasspy/piper-voices v1.0.0) | CC BY 4.0 |
 | Book library (82 public-domain books) | 55 MB + about 37 MB search index built on the device | Project Gutenberg texts via the desktop repo | Public domain |
+| Books you add with **Find a book** | usually 0.2-2 MB each | Project Gutenberg (search via gutendex.com) | Public domain in the USA |
 
 Downloads are at your own discretion. The author of Aurora Companion does **not** own or make these
 third-party models and is not responsible for them; each one is under its own license, which you
@@ -87,7 +96,8 @@ agree to by downloading it. Every download is checked against a pinned checksum.
 - No account, no sign-in, no ads, no analytics, no telemetry
 - Network use: the downloads above when you tap them; the update check (GitHub) if you leave it on; and, **only while
   Online is switched on**, the words of a weather, news or look-up question (or your city) are sent to Open-Meteo,
-  BBC News / Google News RSS, Wikipedia or DuckDuckGo. Your chats are never sent.
+  BBC News / Google News RSS, Wikipedia or DuckDuckGo; **Find a book** sends your search words to gutendex.com and
+  downloads the book from Project Gutenberg. Your chats are never sent.
 - Microphone is used only while you are talking to the companion
 
 ## Family-friendly
