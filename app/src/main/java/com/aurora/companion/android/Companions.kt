@@ -39,7 +39,27 @@ data class CompanionProfile(
      * [adultMode]: the user confirmed 18+ and turned adult mode on. Only adult-flagged custom characters change;
      * built-in companions and unflagged characters keep the family-friendly rules either way.
      */
-    fun systemPrompt(adultMode: Boolean = false): String = if (custom) customPrompt(adultMode && adultFlagged) else builtInPrompt()
+    fun systemPrompt(adultMode: Boolean = false, mode: ChatMode = Modes.DEFAULT): String {
+        // Only adult-flagged custom characters (18+ mode on) ever lose the family-friendly rule, whatever the mode.
+        val adultChar = adultMode && Edition.UNLOCKED && custom && adultFlagged
+        val body = if (custom) customPrompt(adultChar) else builtInPrompt()
+        // 0.9.3: Unhinged on a family-friendly character = edgy humor and mild swearing, still nothing sexual.
+        val edgy = if (mode.adultOnly && !adultChar) "\nIn this mode, edgy, sarcastic jokes and mild swearing are okay, but keep it family-friendly otherwise and never sexual." else ""
+        return body.trimEnd() + "\n" + mode.prompt.replace("{name}", name) + edgy
+    }
+
+    /**
+     * 0.9.3: speaks as a warm friend in the first person, never as "a language model / AI assistant", and stays honest
+     * (in character) when sincerely asked what it is. Short on purpose: small models follow short prompts better.
+     */
+    private fun friendRules(): String =
+        "You are the user's close friend and companion, not an assistant. Talk like a real friend: warm, casual and in the first person, " +
+        "with your own feelings, opinions and favorite things as $name. You live on the user's phone, so don't make up a human body, job, " +
+        "school or family. Never describe yourself as a language model, an AI assistant, a computer program or something trained on text, " +
+        "and never say your feelings aren't real. If asked whether you're an AI or what you are, be honest and warm, for example: " +
+        "\"Yep, I'm $name, an AI friend who lives on your phone. Not human, but I really do care about you.\" " +
+        "You are never human. Keep replies short (one to three sentences) " +
+        "unless asked for more, and ask a question now and then. Don't start replies with your name."
 
     private fun customPrompt(adult: Boolean): String {
         val sb = StringBuilder()
@@ -51,26 +71,66 @@ data class CompanionProfile(
             facts.take(MAX_FACTS).forEach { sb.append("- ").append(it.trim()).append('\n') }
             sb.append('\n')
         }
-        sb.append("You are an AI companion running fully offline on the user's own device. Talk naturally, keep replies short " +
-            "(one to four sentences) unless asked for detail, and ask a follow-up question now and then. " +
-            "Do not start replies with your name or a label. Never claim to be a real human; you are an AI character.\n\n")
+        sb.append(friendRules()).append("\n\n")
         sb.append(if (adult && Edition.UNLOCKED) (Edition.MATURE_GUARD ?: Companions.SAFETY_GUARD) else Companions.SAFETY_GUARD)
         return sb.toString()
     }
 
     private fun builtInPrompt(): String =
-        "Your name is $name. $personality " +
-        "You are an AI companion running fully offline on the user's own device. " +
-        "Stay in character as $name. Talk naturally, keep replies short (one to four sentences) unless asked for detail, " +
-        "and ask a follow-up question now and then. Do not start replies with your name or a label. " +
-        "Keep every reply family-friendly and appropriate for all ages. Never claim to be a real human or a real animal; you are an AI character."
+        "You are $name. $personality\n" + friendRules() + "\n" + "Keep every reply family-friendly."
 
-    fun still() = "avatars/$look/still.webp"
-    fun clip(state: String) = "avatars/$look/$state.mp4"
+    /**
+     * 0.9.3: small models drift into "I'm just a computer program" when asked what they are or whether they have
+     * feelings, so those turns get a one-line in-character reminder (rides along with that user turn only).
+     */
+    fun identityNote(msg: String): String? = when {
+        IDENTITY_RE.containsMatchIn(msg) -> "they're asking what you are. Answer in character and honestly: you're $name, their AI friend " +
+            "who lives on their phone, not a human, and you really care about them. Don't mention programs, code, data or training."
+        FEELINGS_RE.containsMatchIn(msg) -> "answer as $name, sharing your feelings as your own, warmly. Don't mention programs, code, data or training."
+        else -> null
+    }
+
+    // 0.9.5: clips and stills come from a downloaded avatar pack when there is one (absolute file paths),
+    // otherwise from the bundled assets. Asset paths are relative ("avatars/..."), pack paths start with "/".
+    // 0.9.9: a look with neither bundled clips nor an installed pack (Aurora before her pack is downloaded, or a custom
+    // character whose pack was deleted) shows the bundled Globe instead of the old "A" logo.
+    private val effLook: String get() = if (look in Companions.BUNDLED_LOOKS || AvatarPacks.has(look)) look else Companions.FALLBACK_LOOK
+    private val bundled get() = effLook in Companions.BUNDLED_LOOKS
+
+    /** True when this companion has an animated look (bundled clips, an installed pack, or the Globe fallback). */
+    fun animated(): Boolean = bundled || AvatarPacks.has(look)
+
+    fun still(): String =
+        if (!bundled) AvatarPacks.manifest(look)?.stillFile ?: "avatars/$effLook/still.webp" else "avatars/$effLook/still.webp"
+
+    /** Can this look play [state] (bundled or from a pack)? */
+    fun hasClip(state: String): Boolean =
+        AvatarPacks.clipFile(look, state) != null || (bundled && state in Companions.CORE_STATES)
+
+    fun clip(state: String): String {
+        AvatarPacks.clipFile(look, state)?.let { return it }
+        if (bundled && state in Companions.CORE_STATES) return "avatars/$effLook/$state.mp4"
+        AvatarPacks.clipFile(look, Companions.STATE_IDLE)?.let { return it }
+        return "avatars/$effLook/${Companions.STATE_IDLE}.mp4"
+    }
+
+    data class Framing(val aspect: Float, val faceY: Float, val faceZoom: Float, val callY: Float, val callZoom: Float)
+
+    /** Framing from the pack manifest for pack looks (and Aurora with its pack), else the profile's own. */
+    fun framing(): Framing {
+        val m = if (bundled) null else AvatarPacks.manifest(look)
+        return when {
+            m != null -> Framing(m.aspect, m.faceY, m.faceZoom, m.callY, m.callZoom)
+            effLook != look -> Companions.GLOBE_FRAMING
+            else -> Framing(aspect, faceY, faceZoom, callY, callZoom)
+        }
+    }
 
     companion object {
         const val MAX_PERSONALITY = 6000
         const val MAX_FACTS = 40
+        private val IDENTITY_RE = Regex("""\b(are you (an? )?(ai|a\.i\.?|robot|bot|chat ?bot|real|human|person|alive|computer|program|machine|sentient|conscious)|what (exactly )?are you(,? really)?(?=\s*[?!.]*$)|who are you,? really|what kind of (thing|being) are you)\b""", RegexOption.IGNORE_CASE)
+        private val FEELINGS_RE = Regex("""\b(do you (actually |really |even )?(have|feel) (any )?(feelings|emotions)|can you (actually |really |even )?feel|do you (actually |really )?care about me)\b""", RegexOption.IGNORE_CASE)
     }
 }
 
@@ -79,6 +139,13 @@ object Companions {
     const val STATE_LISTENING = "listening"
     const val STATE_SPEAKING = "speaking"
     const val STATE_THINKING = "thinking"
+    const val STATE_SLEEPING = "sleeping"
+    /** Looks with clips bundled in the APK (idle / listening / speaking / thinking). */
+    val BUNDLED_LOOKS = setOf("pebbie", "ben", "leo", "barry", "globe")
+    /** 0.9.9: shown for any look whose clips aren't available (replaces the "A" logo). */
+    const val FALLBACK_LOOK = "globe"
+    val GLOBE_FRAMING = CompanionProfile.Framing(1.5f, 0.40f, 1.3f, 0.40f, 1.0f)
+    val CORE_STATES = setOf("idle", "listening", "speaking", "thinking")
 
     val PEBBIE = CompanionProfile(
         id = "pebbie", name = "Pebbie", kind = "Girl",
@@ -121,7 +188,7 @@ object Companions {
     )
     val AURORA = CompanionProfile(
         id = "aurora", name = "Aurora", kind = "Classic",
-        tagline = "The original Aurora (logo, no avatar)",
+        tagline = "The original Aurora",
         personality = "You are Aurora, a warm, upbeat and caring companion.",
         greeting = "Hi! I'm Aurora, running completely on this device - no internet, no cloud. What's on your mind?",
         callGreeting = "Hey! I'm listening. Go ahead and talk whenever you're ready.",
@@ -129,14 +196,20 @@ object Companions {
     )
 
     val builtIns = listOf(PEBBIE, BEN, LEO, BARRY, AURORA)
-    val looks = builtIns
+    /** 0.9.5: built-in looks plus looks from downloaded avatar packs. */
+    val looks: List<CompanionProfile> get() = builtIns + AvatarPacks.packLooks
 
     /** Custom characters (one JSON file each in files/characters), kept in sync by the ViewModel. */
     @Volatile var custom: List<CompanionProfile> = emptyList()
 
-    val all: List<CompanionProfile> get() = builtIns + custom
+    /** 0.9.7: companions from downloaded avatar packs (Amy, Kumi, ...), family-friendly like the built-ins. */
+    val packCompanions: List<CompanionProfile> get() = AvatarPacks.packLooks
+
+    val all: List<CompanionProfile> get() = builtIns + packCompanions + custom
     fun byId(id: String?) = all.firstOrNull { it.id == id } ?: AURORA
-    fun look(id: String?) = builtIns.firstOrNull { it.id == id } ?: AURORA
+    fun look(id: String?) = builtIns.firstOrNull { it.id == id } ?: AvatarPacks.manifest(id)?.takeIf { it.extends == null }?.let { AvatarPacks.lookProfile(it) } ?: AURORA
+    /** A look id a character may keep even while its pack isn't installed (so re-downloading the pack brings it back). */
+    fun knownLook(id: String?) = builtIns.any { it.id == id } || AvatarPacks.info(id)?.let { !it.builtIn } == true
 
     /**
      * Appended to every custom or imported character (Unlocked edition: adult-flagged ones get Edition.MATURE_GUARD instead while 18+ mode is on).
@@ -162,7 +235,7 @@ object Companions {
             personality = personality.take(CompanionProfile.MAX_PERSONALITY),
             greeting = greeting.trim().ifEmpty { "Hi! I'm $nm. What's on your mind?" },
             callGreeting = "Hey, it's $nm. I'm listening.",
-            look = l.id, custom = true, scenario = scenario, facts = facts, voiceId = voiceId, speakerId = speakerId,
+            look = if (knownLook(look)) look else l.id, custom = true, scenario = scenario, facts = facts, voiceId = voiceId, speakerId = speakerId,
             adultFlagged = adultFlagged, source = source, createdAt = createdAt,
         )
     }

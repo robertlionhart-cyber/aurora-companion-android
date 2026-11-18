@@ -8,6 +8,8 @@
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- Push-to-talk. Audio is transcribed on the device and never uploaded. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- 0.9.3: optional, only if the user turns on "Use approximate location" for weather (Settings > Privacy & online) -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <!-- Call mode: switch to communication audio (echo cancellation, loudspeaker routing). -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
@@ -17,6 +19,11 @@
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- 0.8.9: keep the app alive while an AI model is loaded or a call is on (Samsung otherwise freezes and closes it
+         in the background). specialUse = "keep an on-device AI model loaded"; microphone only during call mode. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
 
     <application
         android:allowBackup="false"
@@ -51,6 +58,16 @@
                 <action android:name="android.app.action.SCHEDULE_EXACT_ALARM_PERMISSION_STATE_CHANGED" />
             </intent-filter>
         </receiver>
+
+        <!-- 0.8.9: keep-alive while a model is loaded / a call is on (internal only). -->
+        <service
+            android:name=".KeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse|microphone">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps a large on-device AI chat model loaded in memory while the user is chatting or in a voice call, so it isn't reloaded (30+ s) every time they switch apps." />
+        </service>
 
         <!-- 0.6: share exported companion packs (cache/share only). -->
         <provider

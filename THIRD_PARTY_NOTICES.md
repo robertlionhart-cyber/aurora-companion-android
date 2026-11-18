@@ -25,9 +25,11 @@ only. Do not redistribute it or use it to impersonate him.
 | Component | License | Source |
 |---|---|---|
 | Llama 3.2 1B / 3B Instruct (GGUF Q4_K_M) | Llama 3.2 Community License and Acceptable Use Policy ("Built with Llama") | https://huggingface.co/meta-llama, quantized by https://huggingface.co/bartowski |
+| Avatar packs | the author's own clips | this repo's `avatars-v1` release |
 | en_US-libritts_r-medium (Piper voice) | CC BY 4.0 (LibriTTS-R dataset) | https://huggingface.co/rhasspy/piper-voices |
 | 82 public-domain books | Public domain (Project Gutenberg texts, Gutenberg headers removed for indexing) | https://www.gutenberg.org via https://github.com/robertlionhart-cyber/aurora-companion-beta |
 
 ## Avatars
 
-The companion avatar clips are short re-encoded copies of the avatars from the Aurora desktop app.
+The companion avatar clips (built in and in the avatar packs) are the author's own creations, re-encoded from the
+Aurora desktop app's avatars. No real people are depicted.

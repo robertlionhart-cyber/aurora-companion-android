@@ -123,9 +123,25 @@ static llama_context *init_context(llama_model *model, const int n_ctx = DEFAULT
     return context;
 }
 
+/**
+ * 0.8.8: chat sampling tuned for small models: temp 0.7, top-k 40, top-p 0.9, min-p 0.05, repeat penalty 1.1 over
+ * the last 64 tokens. DRY is off: on Qwen2.5 1.5B it pushed replies into runaway loops. AURORA_* env vars are
+ * only for the box test harness (never set on Android).
+ */
+static float env_f(const char *k, float d) { const char *v = getenv(k); return v ? (float) atof(v) : d; }
 static common_sampler *new_sampler(float temp) {
     common_params_sampling sparams;
-    sparams.temp = temp;
+    sparams.temp = env_f("AURORA_TEMP", temp);
+    sparams.top_k = 40;
+    sparams.top_p = env_f("AURORA_TOPP", 0.9f);
+    sparams.min_p = env_f("AURORA_MINP", 0.05f);
+    sparams.penalty_last_n = (int) env_f("AURORA_PEN_N", 64);
+    sparams.penalty_repeat = env_f("AURORA_PEN", 1.1f);
+    sparams.dry_multiplier = env_f("AURORA_DRY", 0.0f);
+    sparams.dry_base = 1.75f;
+    sparams.dry_allowed_length = 3;
+    sparams.dry_penalty_last_n = 1024;
+    if (getenv("AURORA_SEED")) sparams.seed = (uint32_t) atoi(getenv("AURORA_SEED"));
     return common_sampler_init(g_model, sparams);
 }
 
@@ -300,6 +316,9 @@ static void reset_long_term_states(const bool clear_kv_cache = true) {
         llama_memory_clear(llama_get_memory(g_context), false);
 }
 
+/** 0.8.8: forget the sampler's penalty history when the context is replaced (new chat, rebuild, restore). */
+static void reset_sampler_history() { if (g_sampler) common_sampler_reset(g_sampler); }
+
 static void reset_short_term_states() {
     stop_generation_position = 0;
     cached_token_chars.clear();
@@ -325,6 +344,27 @@ static std::string chat_add_and_format(const std::string &role, const std::strin
     m.content = content;
     chat_msgs.push_back(m);
     return formatted;
+}
+
+/** Number of chat_msgs that make up the system block (never trimmed): 1, or 2 for templates without a system role. */
+static size_t g_sys_msgs = 1;
+constexpr const char *FOLDED_SYSTEM_ACK = "Okay, I'll stay in character.";
+
+/**
+ * 0.8.9: adds the system prompt and returns its formatted text. Templates with no system role (Gemma) drop a lone
+ * system message, so the instructions go in as the first user turn plus a short model acknowledgement
+ * (<start_of_turn>user ... <end_of_turn><start_of_turn>model ... <end_of_turn>). That block sits before
+ * system_prompt_position, so trimming old turns never removes the persona.
+ */
+static std::string add_system_block(const std::string &system_prompt) {
+    g_sys_msgs = 1;
+    const bool folds = format_msg(ROLE_SYSTEM, "x", false).empty();
+    if (!folds) return chat_add_and_format(ROLE_SYSTEM, system_prompt, false);
+    g_sys_msgs = 2;
+    std::string out = chat_add_and_format(ROLE_USER, system_prompt, false);
+    out += chat_add_and_format(ROLE_ASSISTANT, FOLDED_SYSTEM_ACK, false);
+    LOGi("%s: template has no system role; system prompt folded into the first user turn", __func__);
+    return out;
 }
 
 /** Decodes tokens at current_position. Never shifts: callers make sure they fit (returns 3 if not). */
@@ -375,7 +415,7 @@ static int trim_oldest_turns(int needed, bool keep_last) {
 
     size_t removed_msgs = 0;
     if (has_template()) {
-        const size_t first_msg = 1;   // chat_msgs[0] is the system message
+        const size_t first_msg = g_sys_msgs;   // the system block (1 message, or 2 when folded for Gemma)
         const size_t msg_cut = std::min((k < n_turns) ? turn_msg_index[k] : chat_msgs.size(), chat_msgs.size());
         if (msg_cut > first_msg) {
             chat_msgs.erase(chat_msgs.begin() + first_msg, chat_msgs.begin() + msg_cut);
@@ -423,13 +463,14 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
         jobject /*unused*/,
         jstring jsystem_prompt
 ) {
+    reset_sampler_history();
     reset_long_term_states();
     reset_short_term_states();
 
     const auto *system_prompt = env->GetStringUTFChars(jsystem_prompt, nullptr);
     std::string formatted_system_prompt(system_prompt);
     const bool tmpl = has_template();
-    if (tmpl) formatted_system_prompt = chat_add_and_format(ROLE_SYSTEM, system_prompt, false);
+    if (tmpl) formatted_system_prompt = add_system_block(system_prompt);
     env->ReleaseStringUTFChars(jsystem_prompt, system_prompt);
 
     const auto system_tokens = common_tokenize(g_context, formatted_system_prompt, true, tmpl);
@@ -455,6 +496,7 @@ extern "C"
 JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_loadHistory(
         JNIEnv *env, jobject /*unused*/, jstring jsystem, jobjectArray jroles, jobjectArray jtexts) {
+    reset_sampler_history();
     reset_long_term_states();
     reset_short_term_states();
     const bool tmpl = has_template();
@@ -462,7 +504,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_loadHistory(
     const auto *sys = env->GetStringUTFChars(jsystem, nullptr);
     std::string s(sys);
     env->ReleaseStringUTFChars(jsystem, sys);
-    std::string fs = tmpl ? chat_add_and_format(ROLE_SYSTEM, s, false) : s;
+    std::string fs = tmpl ? add_system_block(s) : s;
     auto toks = common_tokenize(g_context, fs, true, tmpl);
     int rc = decode_at_current(toks, false);
     if (rc) { LOGe("%s: system decode failed (%d)", __func__, rc); reset_long_term_states(); return rc == 3 ? 1 : 2; }
@@ -565,6 +607,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_saveState(JNIEnv * /*env*/, job
 extern "C"
 JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_restoreState(JNIEnv * /*env*/, jobject /*unused*/) {
+    reset_sampler_history();
     if (!g_saved.valid) return 1;
     reset_short_term_states();
     auto *mem = llama_get_memory(g_context);
@@ -696,6 +739,18 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
 
     const auto new_token_id = common_sampler_sample(g_sampler, g_context, -1);
     common_sampler_accept(g_sampler, new_token_id, true);
+
+    // 0.8.8: a control token that isn't end-of-turn (e.g. ChatML <|im_start|>) means the model is starting
+    // a new turn on its own (writing the user's lines). End the reply cleanly instead of printing it.
+    {
+        const auto *vocab = llama_model_get_vocab(g_model);
+        if (!llama_vocab_is_eog(vocab, new_token_id) &&
+            (llama_vocab_get_attr(vocab, new_token_id) & LLAMA_TOKEN_ATTR_CONTROL)) {
+            LOGw("%s: control token %d mid-reply; ending the turn", __func__, new_token_id);
+            close_assistant_turn(true);
+            return nullptr;
+        }
+    }
 
     g_batch.clear();
     g_batch.add(new_token_id, current_position, 0, true);

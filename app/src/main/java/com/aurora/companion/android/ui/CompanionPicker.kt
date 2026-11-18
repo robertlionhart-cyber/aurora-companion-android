@@ -39,7 +39,8 @@ fun CompanionPicker(ui: UiState, vm: AuroraViewModel, sizing: Sizing, firstRun: 
     if (!firstRun) androidx.activity.compose.BackHandler(onBack = onClose)
     // A freshly saved character becomes the highlighted pick.
     LaunchedEffect(ui.lastSavedCharacter) { ui.lastSavedCharacter?.let { id -> if (ui.characters.any { it.id == id }) pick = id } }
-    if (ui.characters.none { it.id == pick } && Companions.builtIns.none { it.id == pick }) pick = Companions.AURORA.id
+    val packComps = remember(ui.packs.revision, ui.packs.installed) { Companions.packCompanions }
+    if (ui.characters.none { it.id == pick } && Companions.builtIns.none { it.id == pick } && packComps.none { it.id == pick }) pick = Companions.AURORA.id
     val ctx = LocalContext.current
     var exportId by remember { mutableStateOf<String?>(null) }
     var showExport by remember { mutableStateOf(false) }
@@ -50,7 +51,8 @@ fun CompanionPicker(ui: UiState, vm: AuroraViewModel, sizing: Sizing, firstRun: 
     val saveCard = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
         val id = exportId; if (uri != null && id != null) vm.exportCharacter(id, uri, card = true)
     }
-    val everyone = Companions.builtIns + ui.characters
+    // 0.9.7: built-ins, then the looks from downloaded avatar packs, then your own characters.
+    val everyone = Companions.builtIns + packComps + ui.characters
     val current = everyone.firstOrNull { it.id == pick } ?: Companions.AURORA
     if (showExport && current.custom) {
         AlertDialog(

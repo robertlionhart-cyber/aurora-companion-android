@@ -116,10 +116,18 @@ fun Brand(sizing: Sizing, subtitle: String? = null) {
 
 @Composable
 fun SetupScreen(ui: UiState, vm: AuroraViewModel, sizing: Sizing) {
-    var agreed by remember { mutableStateOf(false) }
+    // 0.9.0: no inline disclaimer or 18+ switch here. Download -> (18+ model with adult mode off: age confirmation)
+    // -> a short download confirmation -> download.
+    var askAdult by remember { mutableStateOf(false) }
+    var askDownload by remember { mutableStateOf(false) }
+    if (askAdult) AdultModeDialog(onConfirm = { askAdult = false; vm.setAdultMode(true); askDownload = true }, onDismiss = { askAdult = false })
+    if (askDownload) DownloadDialog(ui.selected, ui.ramGb, onConfirm = { askDownload = false; vm.downloadSelected() }, onDismiss = { askDownload = false })
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) vm.importGguf(uri)
     }
+    // First run: light models only (bigger ones are under Settings > Change AI model once you're chatting).
+    val fullList = ui.setupFromSettings || ui.downloaded.isNotEmpty()
+    val shown = if (fullList) ui.options else ModelCatalog.firstRun.filter { it in ui.options }
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
         Column(
             Modifier.widthIn(max = 680.dp).fillMaxWidth().verticalScroll(rememberScrollState()).padding(sizing.pad),
@@ -127,52 +135,42 @@ fun SetupScreen(ui: UiState, vm: AuroraViewModel, sizing: Sizing) {
         ) {
             Spacer(Modifier.height(8.dp))
             Brand(sizing, "Private AI that runs on this device - Android preview")
-            InfoCard {
-                Text("This device", fontWeight = FontWeight.SemiBold)
-                Text("Memory (RAM): %.1f GB   -   Free storage: %s".format(ui.ramGb, ui.freeStorageBytes.toNiceSize()),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 14.sp)
-                if (ModelCatalog.LLAMA_3B !in ui.options) Text("Larger 3B models are hidden: they need a 6 GB device.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
-            }
-            Text("Choose a brain for Aurora", fontWeight = FontWeight.SemiBold, fontSize = (sizing.body + 1).sp)
-            ui.options.forEach { opt ->
+            Text("This device: %.1f GB RAM, %s free".format(ui.ramGb, ui.freeStorageBytes.toNiceSize()),
+                color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
+            Text(if (fullList) "Choose an AI model" else "Choose a brain for Aurora", fontWeight = FontWeight.SemiBold, fontSize = (sizing.body + 1).sp)
+            if (!fullList) Text("Bigger models can be added later in Settings > Change AI model.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
+            shown.forEach { opt ->
                 ModelCard(opt, selected = opt == ui.selected, downloaded = opt.id in ui.downloaded,
+                    recommended = opt == ModelCatalog.recommendedTag(ui.ramGb),
                     onClick = { vm.select(opt) }, onDelete = { vm.deleteModel(opt) })
             }
-            // 0.8.5: downloaded files that aren't offered right now (e.g. an 18+ model with adult mode off) can still be deleted.
-            val hidden = ModelCatalog.all.filter { it.id in ui.downloaded && it !in ui.options }
+            // Downloaded files that aren't offered any more (e.g. Qwen2.5 1.5B) can still be deleted.
+            val hidden = (ModelCatalog.all + ModelCatalog.retired).filter { it.id in ui.downloaded && it !in shown }
             if (hidden.isNotEmpty()) InfoCard {
                 Text("Other downloaded models", fontWeight = FontWeight.SemiBold)
                 hidden.forEach { opt ->
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text(opt.title, fontSize = 14.sp)
-                            Text("${opt.sizeBytes.toNiceSize()} on device - not available right now", fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            if (opt.techName.isNotEmpty()) Text(opt.techName, fontSize = 11.sp, color = Color.Gray)
+                            Text("${opt.sizeBytes.toNiceSize()} on device" + (if (opt in ModelCatalog.retired) " - no longer offered" else ""),
+                                fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         TextButton(onClick = { vm.deleteModel(opt) }) { Text("Delete") }
                     }
                 }
             }
-            InfoCard {
-                Text("Before you download", fontWeight = FontWeight.SemiBold)
-                Text(
-                    "The model is a third-party file (${ui.selected.license}) downloaded from Hugging Face. " +
-                    "Aurora Companion's author does not own the rights to third-party models or apps. " +
-                    "Downloading is optional and at your own discretion. Download size: about ${ui.selected.sizeBytes.toNiceSize()} " +
-                    "(the same amount of storage is used once installed). Wi-Fi is recommended. " +
-                    "After download, chatting works fully offline - nothing you type leaves this device.",
-                    fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { agreed = !agreed }) {
-                    Checkbox(checked = agreed, onCheckedChange = { agreed = it })
-                    Text("I understand and want to continue", fontSize = 14.sp)
-                }
-            }
             val isDownloaded = ui.selected.id in ui.downloaded
             Button(
-                onClick = vm::downloadSelected,
-                enabled = agreed || isDownloaded,
+                onClick = {
+                    when {
+                        isDownloaded && ui.selected.adultOnly && !ui.adultMode -> askAdult = true
+                        isDownloaded -> vm.downloadSelected()
+                        ui.selected.adultOnly && !ui.adultMode -> askAdult = true
+                        else -> askDownload = true
+                    }
+                },
                 modifier = Modifier.fillMaxWidth().height(52.dp),
             ) {
                 Text(if (isDownloaded) "Start chatting" else "Download ${ui.selected.sizeBytes.toNiceSize()} and start")
@@ -185,25 +183,65 @@ fun SetupScreen(ui: UiState, vm: AuroraViewModel, sizing: Sizing) {
     }
 }
 
+/** 0.9.0: the third-party download notice, shown only when a model is picked for download. */
 @Composable
-fun ModelCard(opt: ModelOption, selected: Boolean, downloaded: Boolean, onClick: () -> Unit, onDelete: () -> Unit) {
+fun DownloadDialog(opt: ModelOption, ramGb: Double, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    // 0.9.2: heavy models on phones under ~7 GB get a one-line warning and "Download anyway".
+    val warn = ModelCatalog.isHeavy(opt) && ramGb < ModelCatalog.HEAVY_SAFE_RAM_GB
+    val light = ModelCatalog.recommendedTag(ramGb)
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Download ${opt.title}?") },
+        text = {
+          Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (warn) Text("Your phone has %.1f GB; this model may be slow or close. ${light.title} is recommended for your phone.".format(ramGb),
+                fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.error)
+            Text(
+                "${opt.sizeBytes.toNiceSize()} from Hugging Face (Wi-Fi recommended). It's a third-party model" +
+                    (if (opt.techName.isNotEmpty()) " (${opt.techName}, ${opt.license}); " else " (${opt.license}); ") +
+                    "Aurora's author doesn't own it. After download, chatting is fully offline - nothing you type leaves this device.",
+                fontSize = 14.sp,
+            )
+          }
+        },
+        confirmButton = { TextButton(onClick = onConfirm) { Text(if (warn) "Download anyway" else "Download") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
+fun ModelCard(opt: ModelOption, selected: Boolean, downloaded: Boolean, recommended: Boolean = false, onClick: () -> Unit, onDelete: () -> Unit) {
     val border = if (selected) BorderStroke(2.dp, AuroraBrush) else BorderStroke(1.dp, PanelHi)
     Column(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).border(border, RoundedCornerShape(16.dp))
-            .background(Panel).clickable(onClick = onClick).padding(14.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
+            .background(Panel).clickable(onClick = onClick).padding(horizontal = 10.dp, vertical = 8.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             RadioButton(selected = selected, onClick = onClick)
             Column(Modifier.weight(1f)) {
                 Text(opt.title, fontWeight = FontWeight.SemiBold)
-                Text("${opt.sizeBytes.toNiceSize()} download" + if (downloaded) "  -  on device" else "",
-                    fontSize = 13.sp, color = if (downloaded) AuroraTeal else MaterialTheme.colorScheme.onSurfaceVariant)
+                if (opt.adultOnly || recommended || ModelCatalog.isHeavy(opt) || opt.tag != null)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (opt.adultOnly) ModelTag("18+")
+                    if (recommended) ModelTag("Recommended")
+                    if (ModelCatalog.isHeavy(opt)) ModelTag("Powerful phones")
+                    opt.tag?.let { ModelTag(it) }
+                }
+                Text(opt.note, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (ModelCatalog.isHeavy(opt)) Text(ModelCatalog.POWERFUL_LINE, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (opt.techName.isNotEmpty()) Text(opt.techName, fontSize = 11.sp, color = Color.Gray)
+                Text("${opt.sizeBytes.toNiceSize()}  -  ${opt.ram}" + if (downloaded) "  -  on device" else "",
+                    fontSize = 12.sp, color = if (downloaded) AuroraTeal else MaterialTheme.colorScheme.onSurfaceVariant)
             }
             if (downloaded) TextButton(onClick = onDelete) { Text("Delete") }
         }
-        Text(opt.note, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
+}
+
+@Composable
+private fun ModelTag(text: String) {
+    Text(text, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = AuroraTeal,
+        modifier = Modifier.border(1.dp, AuroraTeal, RoundedCornerShape(6.dp)).padding(horizontal = 5.dp, vertical = 1.dp))
 }
 
 @Composable

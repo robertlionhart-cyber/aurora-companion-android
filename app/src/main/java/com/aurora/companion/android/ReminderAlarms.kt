@@ -188,10 +188,13 @@ object ReminderAlarms {
 
     /** Round face crop of the companion's still (bundled webp), for the notification's large icon. */
     fun avatarBitmap(ctx: Context, c: CompanionProfile, size: Int = 192): Bitmap? = runCatching {
-        if (!c.hasClips) return@runCatching null
-        val src = ctx.assets.open(c.still()).use { BitmapFactory.decodeStream(it) } ?: return@runCatching null
-        val side = (src.width / c.faceZoom).toInt().coerceIn(32, minOf(src.width, src.height))
-        val cy = (src.height * c.faceY).toInt()
+        AvatarPacks.ensure(ctx)
+        if (!c.animated()) return@runCatching null
+        val path = c.still()
+        val src = (if (path.startsWith("/")) BitmapFactory.decodeFile(path) else ctx.assets.open(path).use { BitmapFactory.decodeStream(it) }) ?: return@runCatching null
+        val fr = c.framing()
+        val side = (src.width / fr.faceZoom).toInt().coerceIn(32, minOf(src.width, src.height))
+        val cy = (src.height * fr.faceY).toInt()
         val top = (cy - side / 2).coerceIn(0, src.height - side)
         val left = (src.width - side) / 2
         val out = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)

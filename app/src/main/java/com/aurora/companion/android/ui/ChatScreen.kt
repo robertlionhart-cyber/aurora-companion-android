@@ -6,6 +6,11 @@ import android.Manifest
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -38,6 +43,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -109,7 +115,7 @@ fun ChatScreen(ui: UiState, vm: AuroraViewModel, sizing: Sizing) {
         return
     }
     val comp = ui.companion
-    val avState = avatarState(ui)
+    val avState = rememberAvatarState(ui)
     val cctx = LocalContext.current
     val callPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> if (ok) vm.startCall() }
     val startCall: () -> Unit = {
@@ -132,11 +138,13 @@ fun ChatScreen(ui: UiState, vm: AuroraViewModel, sizing: Sizing) {
                     Text(comp.name, style = TextStyle(brush = AuroraBrush, fontSize = 30.sp, fontWeight = FontWeight.Bold),
                         modifier = Modifier.clickable { showPicker = true })
                     Text(comp.tagline, fontSize = 13.sp, color = Color(0xCCFFFFFF))
+                    ModeChip(ui, vm, comp)
                     if (!ui.voiceReady) Text(ui.voiceStatus, fontSize = 12.sp, color = Color(0xAAFFFFFF))
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         if (ui.inCall) Button(onClick = vm::endCall, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE53935), contentColor = Color.White)) { Text("End call") }
                         else Button(onClick = startCall, enabled = ui.micReady && ui.voiceReady) { Text("\uD83D\uDCDE Call ${comp.name}") }
                         GlassButton(if (ui.autoSpeak) "\uD83D\uDD0A Voice on" else "\uD83D\uDD07 Voice off", enabled = ui.voiceReady, onClick = vm::toggleAutoSpeak)
+                        GlassButton(if (ui.online) "\uD83C\uDF10 Online" else "\uD83C\uDF10 Offline") { vm.setOnline(!ui.online) }
                         GlassButton("Change companion") { showPicker = true }
                         GlassButton("\u23F0 Reminders" + ui.reminders.count { it.active }.let { if (it > 0) " ($it)" else "" }) { showReminders = true }
                         GlassButton("\uD83D\uDCDA Library") { showLibrary = true }
@@ -162,9 +170,22 @@ fun ChatScreen(ui: UiState, vm: AuroraViewModel, sizing: Sizing) {
             .background(Brush.verticalGradient(listOf(Color(0x99000000), Color.Transparent))))
         Box(Modifier.fillMaxWidth().fillMaxHeight(0.55f).align(Alignment.BottomCenter)
             .background(Brush.verticalGradient(0f to Color.Transparent, 0.45f to Color(0x8C000000), 1f to Color(0xE6000000))))
+        // 0.9.8: the top bar is drawn as an overlay (above a tap-outside scrim when its quick menu is open);
+        // the chat column reserves the same height under it.
+        val density = LocalDensity.current
+        var topBarH by remember { mutableStateOf(0.dp) }
+        var menuOpen by remember { mutableStateOf(false) }
+        androidx.activity.compose.BackHandler(enabled = menuOpen) { menuOpen = false }
         Column(Modifier.fillMaxSize().safeDrawingPadding()) {
-            TopBar(ui, vm, comp, onPicker = { showPicker = true }, onSettings = { showSettings = true }, onHistory = { showHistory = true })
+            Spacer(Modifier.height(topBarH))
             ChatColumn(ui, vm, sizing, comp, overlay = true, startCall = startCall, modifier = Modifier.weight(1f).fillMaxWidth(), screenHeight = screenH)
+        }
+        if (menuOpen) {
+            Box(Modifier.fillMaxSize().pointerInput(Unit) { detectTapGestures { menuOpen = false } })
+        }
+        Box(Modifier.fillMaxWidth().safeDrawingPadding().onSizeChanged { topBarH = with(density) { it.height.toDp() } }) {
+            TopBar(ui, vm, comp, menuOpen = menuOpen, onMenu = { menuOpen = it },
+                onPicker = { showPicker = true }, onSettings = { showSettings = true }, onHistory = { showHistory = true })
         }
     }
 }
@@ -186,21 +207,99 @@ private fun IconGlyph(glyph: String, size: Dp = 40.dp, glyphSize: Float = 20f, b
     ) { Text(glyph, fontSize = fixedSp(glyphSize), color = if (enabled) Color.White else Color(0x66FFFFFF)) }
 }
 
-/** Minimal transparent top bar: name (tap = change companion), speaker toggle, new chat, settings. */
+/**
+ * 0.9.8 top bar: name (tap = change companion) + mode chip on the left; on the right only a person-silhouette button and
+ * Settings. The silhouette opens a quick toolbar that slides out to the left (companions, history, new chat, voice,
+ * online). It closes on a second tap, a tap outside, Back, or after picking an item.
+ */
 @Composable
-private fun TopBar(ui: UiState, vm: AuroraViewModel, comp: CompanionProfile, onPicker: () -> Unit, onSettings: () -> Unit, onHistory: () -> Unit) {
-    Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 6.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-        Column(Modifier.weight(1f).clickable(onClick = onPicker)) {
-            Text(comp.name, style = TextStyle(brush = AuroraBrush, fontSize = fixedSp(24f), fontWeight = FontWeight.Bold),
-                maxLines = 1, overflow = TextOverflow.Ellipsis)
-            if (!ui.voiceReady || ui.switchingVoice) Text(ui.voiceStatus, fontSize = fixedSp(11f), color = Color(0xCCFFFFFF), maxLines = 1, overflow = TextOverflow.Ellipsis)
+private fun TopBar(ui: UiState, vm: AuroraViewModel, comp: CompanionProfile, menuOpen: Boolean, onMenu: (Boolean) -> Unit,
+                   onPicker: () -> Unit, onSettings: () -> Unit, onHistory: () -> Unit) {
+    Box(Modifier.fillMaxWidth()) {
+        Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 6.dp, top = 4.dp), verticalAlignment = Alignment.Top) {
+            Column(Modifier.weight(1f)) {
+                Text(comp.name, style = TextStyle(brush = AuroraBrush, fontSize = fixedSp(24f), fontWeight = FontWeight.Bold),
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.clickable(onClick = onPicker))
+                ModeChip(ui, vm, comp)
+                if (!ui.voiceReady || ui.switchingVoice) Text(ui.voiceStatus, fontSize = fixedSp(11f), color = Color(0xCCFFFFFF), maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            Spacer(Modifier.width(4.dp))
+            // Small silhouette = quick menu. Solid glass circle with an outline (teal while open).
+            IconGlyph("\uD83D\uDC64", size = 42.dp, glyphSize = 20f, bg = if (menuOpen) Color(0xCC1FB5A8) else Glass,
+                modifier = Modifier.border(1.dp, if (menuOpen) AuroraTeal else Color(0x40FFFFFF), CircleShape),
+                onClick = { onMenu(!menuOpen) })
+            Spacer(Modifier.width(4.dp))
+            IconGlyph("\u2699", size = 42.dp, glyphSize = 22f, onClick = { onMenu(false); onSettings() })
         }
-        IconGlyph(if (ui.autoSpeak) "\uD83D\uDD0A" else "\uD83D\uDD07", enabled = ui.voiceReady, onClick = vm::toggleAutoSpeak)
-        Box(Modifier.clip(RoundedCornerShape(18.dp)).clickable(onClick = vm::newChat).padding(horizontal = 10.dp, vertical = 8.dp)) {
-            Text("New", fontSize = fixedSp(15f), color = AuroraTeal, fontWeight = FontWeight.SemiBold)
+        // The toolbar overlays the name area while open (end offset = gear + silhouette + gaps + padding).
+        AnimatedVisibility(
+            visible = menuOpen,
+            modifier = Modifier.align(Alignment.TopEnd).padding(end = 6.dp + 42.dp + 4.dp + 42.dp + 6.dp, top = 2.dp, start = 8.dp),
+            enter = expandHorizontally(expandFrom = Alignment.End) + fadeIn(),
+            exit = shrinkHorizontally(shrinkTowards = Alignment.End) + fadeOut(),
+        ) {
+            Row(
+                Modifier.clip(RoundedCornerShape(26.dp)).background(Color(0xD9000000))
+                    .border(1.dp, Color(0x40FFFFFF), RoundedCornerShape(26.dp))
+                    .pointerInput(Unit) { detectTapGestures { } }   // taps on the gaps don't fall through to the name below
+                    .padding(horizontal = 4.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                val pick: (() -> Unit) -> Unit = { action -> onMenu(false); action() }
+                ToolItem("\uD83D\uDC65", "People") { pick(onPicker) }
+                ToolItem("\uD83D\uDD58", "History") { pick(onHistory) }
+                ToolItem("\u270F\uFE0F", "New chat") { pick(vm::newChat) }
+                ToolItem(if (ui.autoSpeak) "\uD83D\uDD0A" else "\uD83D\uDD07", if (ui.autoSpeak) "Voice on" else "Voice off",
+                    enabled = ui.voiceReady) { pick(vm::toggleAutoSpeak) }
+                ToolItem("\uD83C\uDF10", if (ui.online) "Online" else "Offline", active = ui.online) { pick { vm.setOnline(!ui.online) } }
+            }
         }
-        IconGlyph("\uD83D\uDD58", glyphSize = 19f, onClick = onHistory)
-        IconGlyph("\u2699", glyphSize = 22f, onClick = onSettings)
+    }
+}
+
+/** One quick-toolbar item: a glass circle with a small caption (fixed sizes, so large system fonts still fit). */
+@Composable
+private fun ToolItem(glyph: String, label: String, enabled: Boolean = true, active: Boolean = false, onClick: () -> Unit) {
+    Column(
+        Modifier.width(54.dp).clip(RoundedCornerShape(12.dp)).clickable(enabled = enabled, onClick = onClick).padding(vertical = 2.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Box(
+            Modifier.size(40.dp).clip(CircleShape).background(if (active) Color(0xCC1FB5A8) else Glass)
+                .border(1.dp, if (active) AuroraTeal else Color(0x40FFFFFF), CircleShape),
+            contentAlignment = Alignment.Center,
+        ) { Text(glyph, fontSize = fixedSp(19f), color = if (enabled) Color.White else Color(0x66FFFFFF)) }
+        Text(label, fontSize = fixedSp(10f), color = if (enabled) Color.White else Color(0x88FFFFFF), maxLines = 1,
+            overflow = TextOverflow.Clip, modifier = Modifier.padding(top = 1.dp))
+    }
+}
+
+/** 0.9.3: compact mode chip under the name; opens the list of modes (18+ ones only while adult mode is on). */
+@Composable
+private fun ModeChip(ui: UiState, vm: AuroraViewModel, comp: CompanionProfile) {
+    var open by remember { mutableStateOf(false) }
+    val modes = com.aurora.companion.android.Modes.available(ui.adultMode, comp)
+    val cur = if (ui.mode in modes) ui.mode else com.aurora.companion.android.Modes.DEFAULT
+    Box {
+        Row(Modifier.padding(top = 2.dp).clip(RoundedCornerShape(14.dp)).background(Glass)
+            .border(1.dp, Color(0x40FFFFFF), RoundedCornerShape(14.dp)).clickable { open = true }
+            .padding(horizontal = 10.dp, vertical = 3.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("${cur.emoji} ${cur.label} \u25BE", fontSize = fixedSp(13f), color = Color.White, maxLines = 1)
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            modes.forEach { m ->
+                DropdownMenuItem(
+                    text = {
+                        Column {
+                            Text("${m.emoji}  ${m.label}", fontSize = fixedSp(15f), fontWeight = if (m == cur) FontWeight.Bold else FontWeight.Normal)
+                            Text(m.hint, fontSize = fixedSp(12f), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    },
+                    trailingIcon = if (m == cur) ({ Text("\u2713", color = AuroraTeal, fontSize = fixedSp(16f)) }) else null,
+                    onClick = { open = false; vm.setMode(m) },
+                )
+            }
+        }
     }
 }
 
@@ -278,6 +377,7 @@ private fun ChatColumn(ui: UiState, vm: AuroraViewModel, sizing: Sizing, comp: C
                 }
             }
         }
+        // 0.9.8: the speaker toggle moved into the top-bar quick menu (silhouette button).
         if (ui.inCall) CallBar(ui, comp, onMute = vm::toggleMute, onEnd = vm::endCall)
         else InputBar(ui, onSend = vm::send, onStop = vm::stop, onCall = startCall,
             onMicDown = vm::startListening, onMicUp = vm::stopListening, onLatch = vm::latchListening, onAutoStart = vm::startAutoListening)
@@ -454,144 +554,325 @@ private fun Chevron() = Text("\u203A", fontSize = fixedSp(26f), color = Material
 @Composable
 fun SettingsScreen(ui: UiState, vm: AuroraViewModel, sizing: Sizing, onClose: () -> Unit, onPickCompanion: () -> Unit,
                    onReminders: () -> Unit, onLibrary: () -> Unit, onHistory: () -> Unit, onMemory: () -> Unit) {
-    androidx.activity.compose.BackHandler(onBack = onClose)
-    var agreed by remember { mutableStateOf(false) }
+    // 0.9.3: a short main list; details live on sub-pages.
+    var page by remember { mutableStateOf<String?>(null) }
+    androidx.activity.compose.BackHandler { if (page == "avatars") page = "companion" else if (page != null) page = null else onClose() }
     var askAdult by remember { mutableStateOf(false) }
     if (askAdult) AdultModeDialog(onConfirm = { askAdult = false; vm.setAdultMode(true) }, onDismiss = { askAdult = false })
+    val title = when (page) {
+        "companion" -> "Companion"; "avatars" -> "Avatars"; "voice" -> "Voice & calls"; "chat" -> "Chat & memory"; "model" -> "AI model"
+        "privacy" -> "Privacy & online"; "adult" -> "18+"; "updates" -> "Updates"; "about" -> "About"; else -> "Settings"
+    }
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
         Column(Modifier.widthIn(max = 760.dp).fillMaxSize()) {
-            Row(Modifier.fillMaxWidth().padding(start = sizing.pad, end = 4.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text("Settings", fontSize = (sizing.body + 7).sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            Row(Modifier.fillMaxWidth().padding(start = if (page != null) 0.dp else sizing.pad, end = 4.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (page != null) TextButton(onClick = { page = if (page == "avatars") "companion" else null }) { Text("\u2039", fontSize = fixedSp(26f)) }
+                Text(title, fontSize = (sizing.body + 7).sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                 TextButton(onClick = onClose) { Text("Done") }
             }
             Column(
                 Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = sizing.pad),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                SectionTitle("Companion")
-                Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Panel).clickable(onClick = onPickCompanion).padding(10.dp),
-                    verticalAlignment = Alignment.CenterVertically) {
-                    CompanionAvatar(ui.companion, "idle", 48.dp, animate = false)
-                    Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text(ui.companion.name, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(ui.companion.tagline, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                        Text("Change / create \u203A", fontSize = 13.sp, color = AuroraTeal)
-                    }
-                }
-                SettingRow("Animated avatar", "Off = still picture, saves a little battery.") {
-                    Switch(checked = ui.animateAvatar, onCheckedChange = { vm.setAnimateAvatar(it) })
-                }
-                HorizontalDivider(Modifier.padding(vertical = 4.dp))
-                SectionTitle("Tools")
-                val n = ui.reminders.count { it.active }
-                SettingRow("\u23F0 Reminders" + if (n > 0) " ($n open)" else "", "Or say \"remind me to... at 5pm\" in chat.", onClick = onReminders) { Chevron() }
-                SettingRow("\uD83D\uDCDA Library", when {
-                    ui.library.indexedBooks > 0 -> "${ui.library.indexedBooks} public-domain books offline."
-                    ui.library.anyDownloaded -> "Partly downloaded. Open to continue."
-                    else -> "Public-domain books, optional download (about ${ui.library.totalBytes.toNiceSize()})."
-                }, onClick = onLibrary) { Chevron() }
-                SettingRow("\uD83D\uDD58 Conversation history", "Read, continue, share or delete past chats and calls (saved on this phone only).", onClick = onHistory) { Chevron() }
-                SettingRow("\uD83E\uDDE0 Memory", if (ui.memoryOn) "What ${ui.companion.name} remembers about you. View, edit or forget." else "Off: ${ui.companion.name} starts every chat fresh.", onClick = onMemory) { Chevron() }
-                SettingRow("Knowledge from books", "Adds short book passages to questions and names the book. Off by default under 6 GB RAM.") {
-                    Switch(checked = ui.bookKnowledge, onCheckedChange = { vm.setBookKnowledge(it) })
-                }
-                HorizontalDivider(Modifier.padding(vertical = 4.dp))
-                SectionTitle("${ui.companion.name}'s voice")
-                Hint("Each companion remembers its own voice. Robert's voice is the default.")
-                VoiceCatalog.all.forEach { v ->
-                    val installed = v.id in ui.installedVoices
-                    Row(verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.fillMaxWidth().clickable(enabled = installed && !ui.switchingVoice) { vm.selectVoice(v.id) }) {
-                        RadioButton(selected = ui.voiceId == v.id, enabled = installed && !ui.switchingVoice, onClick = { vm.selectVoice(v.id) })
-                        Column(Modifier.weight(1f)) {
-                            Text(v.title, fontSize = 15.sp)
-                            Hint(if (v.builtIn) "Built in" else if (installed) "Downloaded (${v.modelBytes.toNiceSize()})" else "Optional download: ${v.modelBytes.toNiceSize()}")
-                        }
-                        if (!v.builtIn && installed) TextButton(onClick = { vm.deleteVoice(v.id) }) { Text("Delete") }
-                    }
-                    if (!v.builtIn && !installed) {
-                        Hint(v.note + " Downloaded from Hugging Face (piper-voices v1.0.0, checksum-verified). " +
-                            "We don't own the rights to third-party voices; downloading is optional and at your own discretion. Wi-Fi recommended.")
-                        val p = ui.voiceDownload
-                        if (p != null) {
-                            LinearProgressIndicator(progress = { p.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("${(p * 100).toInt()}%  - keep this open", fontSize = 12.sp, modifier = Modifier.weight(1f))
-                                TextButton(onClick = vm::cancelVoiceDownload) { Text("Cancel") }
-                            }
-                        } else {
-                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { agreed = !agreed }) {
-                                Checkbox(checked = agreed, onCheckedChange = { agreed = it })
-                                Text("I understand", fontSize = 13.sp)
-                            }
-                            Button(onClick = { vm.downloadVoice(v.id) }, enabled = agreed) { Text("Download ${v.modelBytes.toNiceSize()}") }
+                when (page) {
+                    null -> SettingsMain(ui, onPickCompanion, onReminders, onLibrary) { page = it }
+                    "companion" -> CompanionPage(ui, vm) { page = "avatars" }
+                    "avatars" -> AvatarsPage(ui, vm)
+                    "voice" -> VoicePage(ui, vm)
+                    "chat" -> {
+                        SettingRow("\uD83D\uDD58 History", "Past chats and calls", onClick = onHistory) { Chevron() }
+                        SettingRow("\uD83E\uDDE0 Memory", if (ui.memoryOn) "What ${ui.companion.name} remembers" else "Off", onClick = onMemory) { Chevron() }
+                        SettingRow("Knowledge from books", "Adds short book passages to answers") {
+                            Switch(checked = ui.bookKnowledge, onCheckedChange = { vm.setBookKnowledge(it) })
                         }
                     }
-                }
-                if (ui.voiceId == VoiceCatalog.LIBRITTS.id && ui.numSpeakers > 1) {
-                    Text("LibriTTS speaker: #${ui.speakerId}", fontWeight = FontWeight.SemiBold)
-                    var pos by remember(ui.speakerId) { mutableStateOf(ui.speakerId.toFloat()) }
-                    Slider(value = pos, onValueChange = { pos = it }, onValueChangeFinished = { vm.setSpeaker(pos.toInt()) },
-                        valueRange = 0f..(ui.numSpeakers - 1).toFloat())
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        OutlinedButton(onClick = { vm.setSpeaker((ui.speakerId - 1).coerceAtLeast(0)); vm.testVoice() }) { Text("\u25C0") }
-                        OutlinedButton(onClick = { vm.setSpeaker((ui.speakerId + 1).coerceAtMost(ui.numSpeakers - 1)); vm.testVoice() }) { Text("\u25B6") }
-                        OutlinedButton(onClick = { vm.setSpeaker((0 until ui.numSpeakers).random()); vm.testVoice() }) { Text("Random") }
+                    "model" -> {
+                        Text(com.aurora.companion.android.ModelCatalog.byFileName(ui.loadedModelName)?.title ?: ui.loadedModelName ?: "-",
+                            fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                        com.aurora.companion.android.ModelCatalog.byFileName(ui.loadedModelName)?.techName?.takeIf { it.isNotEmpty() }?.let { Hint(it) }
+                        Hint("This phone: %.1f GB RAM".format(ui.ramGb))
+                        Button(onClick = { onClose(); vm.backToSetup() }) { Text("Change AI model") }
                     }
-                }
-                if (ui.switchingVoice) Text("Loading voice...", fontSize = 12.sp, color = AuroraTeal)
-                SettingRow("Speak replies", "Read ${ui.companion.name}'s replies out loud (also the speaker button at the top).") {
-                    Switch(checked = ui.autoSpeak, enabled = ui.voiceReady, onCheckedChange = { vm.toggleAutoSpeak() })
-                }
-                OutlinedButton(onClick = vm::testVoice, enabled = ui.voiceReady && !ui.switchingVoice) { Text("\u25B6 Test voice") }
-                Hint(ui.voiceStatus)
-
-                HorizontalDivider(Modifier.padding(vertical = 4.dp))
-                SectionTitle("Microphone (small mic at the left of the message box)")
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().clickable { vm.setMicMode(MIC_AUTO) }) {
-                    RadioButton(selected = ui.micMode == MIC_AUTO, onClick = { vm.setMicMode(MIC_AUTO) })
-                    Column(Modifier.weight(1f)) { Text("Hands-free (tap once)", fontSize = 15.sp); Hint("Stops by itself when you stop talking, then sends.") }
-                }
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().clickable { vm.setMicMode(MIC_HOLD) }) {
-                    RadioButton(selected = ui.micMode == MIC_HOLD, onClick = { vm.setMicMode(MIC_HOLD) })
-                    Column(Modifier.weight(1f)) { Text("Hold to talk", fontSize = 15.sp); Hint("Hold the mic while talking and let go to send (quick tap = tap to start/stop).") }
-                }
-                HorizontalDivider(Modifier.padding(vertical = 4.dp))
-                SectionTitle("Call mode (phone button in the message box)")
-                SettingRow("Barge-in", "Talk over ${ui.companion.name} to interrupt.") {
-                    Switch(checked = ui.bargeIn, onCheckedChange = { vm.setBargeIn(it) })
-                }
-                if (ui.bargeIn) {
-                    Text("Barge-in sensitivity", fontSize = 13.sp)
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        listOf("low" to "Low", "medium" to "Medium", "high" to "High").forEach { (k, label) ->
-                            if (ui.bargeSensitivity == k) Button(onClick = { vm.setBargeSensitivity(k) }) { Text(label) }
-                            else OutlinedButton(onClick = { vm.setBargeSensitivity(k) }) { Text(label) }
+                    "privacy" -> PrivacyPage(ui, vm)
+                    "adult" -> {
+                        SettingRow("\uD83D\uDD1E Adult mode", if (ui.adultMode) "On" else "Off (family-friendly)") {
+                            Switch(checked = ui.adultMode, onCheckedChange = { if (it) askAdult = true else vm.setAdultMode(false) })
                         }
+                        Hint("For adults only. Unlocks adult-marked characters (and Romantic mode for them), Unhinged mode, the adult book and the uncensored models. Asks you to confirm your age.")
                     }
-                    Hint("Low = fewer false interruptions on loudspeaker. High = interrupts more easily (best with headphones).")
+                    "updates" -> UpdatesSection(ui, vm)
+                    "about" -> AboutPage()
                 }
-                Text("Tip: headphones give the best calls, because ${ui.companion.name} can't hear their own voice.", fontSize = 12.sp, color = AuroraTeal)
-                HorizontalDivider(Modifier.padding(vertical = 4.dp))
-                SectionTitle("AI model")
-                Hint("Model: ${ui.loadedModelName ?: "-"}  -  RAM %.1f GB".format(ui.ramGb))
-                OutlinedButton(onClick = { onClose(); vm.backToSetup() }) { Text("Change AI model") }
-                if (com.aurora.companion.android.Edition.UNLOCKED) {
-                    HorizontalDivider(Modifier.padding(vertical = 4.dp))
-                    SectionTitle("Adult content")
-                    SettingRow("\uD83D\uDD1E Adult mode (18+)", if (ui.adultMode)
-                            "On. Adult-marked characters, the adult book and the uncensored models are available. Turn off any time."
-                        else "Off (family-friendly). For adults only; asks you to confirm your age.") {
-                        Switch(checked = ui.adultMode, onCheckedChange = { if (it) askAdult = true else vm.setAdultMode(false) })
-                    }
-                }
-                HorizontalDivider(Modifier.padding(vertical = 4.dp))
-                UpdatesSection(ui, vm)
                 Spacer(Modifier.height(24.dp))
             }
         }
     }
+}
+
+/** One row of the main Settings list: icon, short label, one short hint, chevron. */
+@Composable
+private fun NavRow(icon: String, title: String, hint: String?, onClick: () -> Unit) {
+    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Panel).clickable(onClick = onClick).padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        Text(icon, fontSize = fixedSp(20f), modifier = Modifier.width(34.dp))
+        Column(Modifier.weight(1f)) {
+            Text(title, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            if (hint != null) Text(hint, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        }
+        Chevron()
+    }
+}
+
+@Composable
+private fun SettingsMain(ui: UiState, onPickCompanion: () -> Unit, onReminders: () -> Unit, onLibrary: () -> Unit, go: (String) -> Unit) {
+    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Panel).clickable(onClick = onPickCompanion).padding(10.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        CompanionAvatar(ui.companion, "idle", 48.dp, animate = false)
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(ui.companion.name, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text("Change / create \u203A", fontSize = 13.sp, color = AuroraTeal)
+        }
+    }
+    NavRow("\uD83D\uDE0A", "Companion", "Mode: ${ui.mode.label}", onClick = { go("companion") })
+    NavRow("\uD83C\uDFA4", "Voice & calls", VoiceCatalog.byId(ui.voiceId).title, onClick = { go("voice") })
+    NavRow("\uD83D\uDCAC", "Chat & memory", "History, memory, books", onClick = { go("chat") })
+    NavRow("\uD83E\uDDE9", "AI model", com.aurora.companion.android.ModelCatalog.byFileName(ui.loadedModelName)?.title ?: ui.loadedModelName, onClick = { go("model") })
+    NavRow("\uD83D\uDCDA", "Library", if (ui.library.indexedBooks > 0) "${ui.library.indexedBooks} books" else "Free books", onClick = onLibrary)
+    val n = ui.reminders.count { it.active }
+    NavRow("\u23F0", "Reminders", if (n > 0) "$n open" else null, onClick = onReminders)
+    NavRow("\uD83D\uDD12", "Privacy & online", if (ui.online) "Online" else "Offline", onClick = { go("privacy") })
+    if (com.aurora.companion.android.Edition.UNLOCKED)
+        NavRow("\uD83D\uDD1E", "18+", if (ui.adultMode) "On" else "Off", onClick = { go("adult") })
+    NavRow("\u2B07\uFE0F", "Updates", if (ui.update.info != null) "Update available" else null, onClick = { go("updates") })
+    NavRow("\u2139\uFE0F", "About", null, onClick = { go("about") })
+}
+
+@Composable
+private fun CompanionPage(ui: UiState, vm: AuroraViewModel, onAvatars: () -> Unit) {
+    val modes = com.aurora.companion.android.Modes.available(ui.adultMode, ui.companion)
+    SectionTitle("${ui.companion.name}'s mode")
+    modes.forEach { m ->
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().clickable { vm.setMode(m) }) {
+            RadioButton(selected = ui.mode == m, onClick = { vm.setMode(m) })
+            Column(Modifier.weight(1f)) { Text("${m.emoji} ${m.label}", fontSize = 15.sp); Hint(m.hint) }
+        }
+    }
+    Hint("Also the chip under the name in the chat.")
+    HorizontalDivider(Modifier.padding(vertical = 4.dp))
+    SectionTitle("Default mode")
+    Hint("For companions you haven't set a mode for.")
+    var open by remember { mutableStateOf(false) }
+    Box {
+        OutlinedButton(onClick = { open = true }) { Text("${ui.defaultMode.emoji} ${ui.defaultMode.label} \u25BE") }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            com.aurora.companion.android.Modes.base.forEach { m ->
+                DropdownMenuItem(text = { Text("${m.emoji}  ${m.label}") }, onClick = { open = false; vm.setDefaultMode(m) })
+            }
+        }
+    }
+    HorizontalDivider(Modifier.padding(vertical = 4.dp))
+    SettingRow("Animated avatar", "Off saves a little battery") {
+        Switch(checked = ui.animateAvatar, onCheckedChange = { vm.setAnimateAvatar(it) })
+    }
+    val n = ui.packs.installed.size
+    SettingRow("\uD83C\uDFAD Avatars", if (n > 0) "$n pack${if (n == 1) "" else "s"} installed" else "Extra animations and new looks", onClick = onAvatars) { Chevron() }
+}
+
+/** 0.9.5: Settings > Companion > Avatars: download / delete everyday avatar packs, with a preview. */
+@Composable
+private fun AvatarsPage(ui: UiState, vm: AuroraViewModel) {
+    LaunchedEffect(Unit) { vm.importPackInbox() }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) vm.importPackFile(uri) }
+    Hint("Extra animations for the companions, and new looks (companions you can chat with or use for your own characters)" +
+        (if (com.aurora.companion.android.Edition.UNLOCKED) ". Everyday clips, plus a few beach (swimwear) clips for some adult looks." else ". Everyday clips only.") +
+        " Small downloads; Wi-Fi recommended.")
+    ui.packs.status?.let { Text(it, fontSize = 12.sp, color = AuroraTeal) }
+    val (builtIn, looks) = com.aurora.companion.android.AvatarPacks.catalog.partition { it.builtIn }
+    SectionTitle("Extra animations")
+    val importFile = { picker.launch(arrayOf("application/zip", "application/octet-stream", "application/x-zip-compressed")) }
+    builtIn.forEach { PackRow(it, ui, vm, importFile) }
+    if (looks.isNotEmpty()) {
+        HorizontalDivider(Modifier.padding(vertical = 4.dp))
+        SectionTitle("New looks")
+        Hint("Use one for your own character: Change / create > Create (or Edit) > Look.")
+        looks.forEach { PackRow(it, ui, vm, importFile) }
+    }
+    HorizontalDivider(Modifier.padding(vertical = 4.dp))
+    OutlinedButton(onClick = { picker.launch(arrayOf("application/zip", "application/octet-stream", "application/x-zip-compressed")) },
+        enabled = ui.packs.downloading == null) { Text("Import pack from file") }
+    Hint("Only Aurora's own avatar packs are accepted (each file's checksum is checked).")
+}
+
+@Composable
+private fun PackRow(info: com.aurora.companion.android.AvatarPacks.PackInfo, ui: UiState, vm: AuroraViewModel, onImport: () -> Unit) {
+    val packs = ui.packs
+    val installed = info.id in packs.installed
+    var preview by remember(info.id) { mutableStateOf(false) }
+    val profile: CompanionProfile? = remember(info.id, packs.revision) {
+        if (info.builtIn) com.aurora.companion.android.Companions.byId(info.extends)
+        else com.aurora.companion.android.AvatarPacks.manifest(info.id)?.let { com.aurora.companion.android.AvatarPacks.lookProfile(it) }
+    }
+    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Panel).clickable(enabled = installed) { preview = !preview }.padding(10.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (profile != null) CompanionAvatar(profile, "idle", 52.dp, animate = false)
+            else Box(Modifier.size(52.dp).clip(CircleShape).background(Color(0xFF22252E)), contentAlignment = Alignment.Center) {
+                Text(info.name.take(1), fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color(0xCCFFFFFF))
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(info.name, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                Hint("${info.clips} clips \u00B7 ${info.size.toNiceSize()}" + (if (info.swimwear) " \u00B7 incl. swimwear" else "") + if (installed) " \u00B7 installed (tap to preview)" else "")
+            }
+            when {
+                packs.downloading == info.id -> TextButton(onClick = vm::cancelPackDownload) { Text("Cancel") }
+                installed && com.aurora.companion.android.AvatarPacks.outdated(info.id) ->   // 0.9.9: newer clips available
+                    Button(onClick = { vm.downloadPack(info.id) }, enabled = packs.downloading == null) { Text("Update") }
+                installed -> TextButton(onClick = { preview = false; vm.deletePack(info.id) }) { Text("Delete") }
+                // 0.9.9: packs that aren't hosted online (Horizon) come only from a file you already have.
+                !info.hosted -> OutlinedButton(onClick = onImport, enabled = packs.downloading == null) { Text("Import from file") }
+                else -> Button(onClick = { vm.downloadPack(info.id) }, enabled = packs.downloading == null) { Text("Download") }
+            }
+        }
+        if (packs.downloading == info.id) {
+            val p = packs.progress
+            if (p != null) LinearProgressIndicator(progress = { p.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().padding(top = 6.dp))
+            else LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(top = 6.dp))
+        }
+        if (preview && installed && profile != null) {
+            val clips = remember(info.id, packs.revision) { com.aurora.companion.android.AvatarPacks.manifest(info.id)?.clips?.keys?.toList().orEmpty() }
+            var i by remember(info.id) { mutableStateOf(0) }
+            LaunchedEffect(clips) { while (clips.isNotEmpty()) { kotlinx.coroutines.delay(4_000); i = (i + 1) % clips.size } }
+            val state = clips.getOrNull(i) ?: "idle"
+            Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                CompanionAvatar(profile, state, 132.dp, animate = true, call = true)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(state.replace('_', ' '), fontSize = 14.sp, color = AuroraTeal)
+                    Hint(clips.joinToString(", ") { it.replace('_', ' ') })
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun VoicePage(ui: UiState, vm: AuroraViewModel) {
+    var agreed by remember { mutableStateOf(false) }
+    SectionTitle("${ui.companion.name}'s voice")
+    Hint("Each companion remembers its own voice. Robert's voice is the default.")
+    VoiceCatalog.all.forEach { v ->
+        val installed = v.id in ui.installedVoices
+        Row(verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth().clickable(enabled = installed && !ui.switchingVoice) { vm.selectVoice(v.id) }) {
+            RadioButton(selected = ui.voiceId == v.id, enabled = installed && !ui.switchingVoice, onClick = { vm.selectVoice(v.id) })
+            Column(Modifier.weight(1f)) {
+                Text(v.title, fontSize = 15.sp)
+                Hint(if (v.builtIn) "Built in" else if (installed) "Downloaded (${v.modelBytes.toNiceSize()})" else "Optional download: ${v.modelBytes.toNiceSize()}")
+            }
+            if (!v.builtIn && installed) TextButton(onClick = { vm.deleteVoice(v.id) }) { Text("Delete") }
+        }
+        if (!v.builtIn && !installed) {
+            Hint(v.note + " Downloaded from Hugging Face (piper-voices v1.0.0, checksum-verified). " +
+                "We don't own the rights to third-party voices; downloading is optional and at your own discretion. Wi-Fi recommended.")
+            val p = ui.voiceDownload
+            if (p != null) {
+                LinearProgressIndicator(progress = { p.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("${(p * 100).toInt()}%  - keep this open", fontSize = 12.sp, modifier = Modifier.weight(1f))
+                    TextButton(onClick = vm::cancelVoiceDownload) { Text("Cancel") }
+                }
+            } else {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { agreed = !agreed }) {
+                    Checkbox(checked = agreed, onCheckedChange = { agreed = it })
+                    Text("I understand", fontSize = 13.sp)
+                }
+                Button(onClick = { vm.downloadVoice(v.id) }, enabled = agreed) { Text("Download ${v.modelBytes.toNiceSize()}") }
+            }
+        }
+    }
+    if (ui.voiceId == VoiceCatalog.LIBRITTS.id && ui.numSpeakers > 1) {
+        Text("LibriTTS speaker: #${ui.speakerId}", fontWeight = FontWeight.SemiBold)
+        var pos by remember(ui.speakerId) { mutableStateOf(ui.speakerId.toFloat()) }
+        Slider(value = pos, onValueChange = { pos = it }, onValueChangeFinished = { vm.setSpeaker(pos.toInt()) },
+            valueRange = 0f..(ui.numSpeakers - 1).toFloat())
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            OutlinedButton(onClick = { vm.setSpeaker((ui.speakerId - 1).coerceAtLeast(0)); vm.testVoice() }) { Text("\u25C0") }
+            OutlinedButton(onClick = { vm.setSpeaker((ui.speakerId + 1).coerceAtMost(ui.numSpeakers - 1)); vm.testVoice() }) { Text("\u25B6") }
+            OutlinedButton(onClick = { vm.setSpeaker((0 until ui.numSpeakers).random()); vm.testVoice() }) { Text("Random") }
+        }
+    }
+    if (ui.switchingVoice) Text("Loading voice...", fontSize = 12.sp, color = AuroraTeal)
+    SettingRow("Speak replies", "Read replies out loud") {
+        Switch(checked = ui.autoSpeak, enabled = ui.voiceReady, onCheckedChange = { vm.toggleAutoSpeak() })
+    }
+    OutlinedButton(onClick = vm::testVoice, enabled = ui.voiceReady && !ui.switchingVoice) { Text("\u25B6 Test voice") }
+    Hint(ui.voiceStatus)
+
+    HorizontalDivider(Modifier.padding(vertical = 4.dp))
+    SectionTitle("Microphone")
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().clickable { vm.setMicMode(MIC_AUTO) }) {
+        RadioButton(selected = ui.micMode == MIC_AUTO, onClick = { vm.setMicMode(MIC_AUTO) })
+        Column(Modifier.weight(1f)) { Text("Hands-free (tap once)", fontSize = 15.sp); Hint("Stops by itself when you stop talking, then sends.") }
+    }
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().clickable { vm.setMicMode(MIC_HOLD) }) {
+        RadioButton(selected = ui.micMode == MIC_HOLD, onClick = { vm.setMicMode(MIC_HOLD) })
+        Column(Modifier.weight(1f)) { Text("Hold to talk", fontSize = 15.sp); Hint("Hold the mic while talking and let go to send (quick tap = tap to start/stop).") }
+    }
+    HorizontalDivider(Modifier.padding(vertical = 4.dp))
+    SectionTitle("Calls")
+    SettingRow("Barge-in", "Talk over ${ui.companion.name} to interrupt.") {
+        Switch(checked = ui.bargeIn, onCheckedChange = { vm.setBargeIn(it) })
+    }
+    if (ui.bargeIn) {
+        Text("Barge-in sensitivity", fontSize = 13.sp)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf("low" to "Low", "medium" to "Medium", "high" to "High").forEach { (k, label) ->
+                if (ui.bargeSensitivity == k) Button(onClick = { vm.setBargeSensitivity(k) }) { Text(label) }
+                else OutlinedButton(onClick = { vm.setBargeSensitivity(k) }) { Text(label) }
+            }
+        }
+        Hint("Low = fewer false interruptions on loudspeaker. High = interrupts more easily (best with headphones).")
+    }
+    Text("Tip: headphones give the best calls, because ${ui.companion.name} can't hear their own voice.", fontSize = 12.sp, color = AuroraTeal)
+}
+
+@Composable
+private fun PrivacyPage(ui: UiState, vm: AuroraViewModel) {
+    val ctx = LocalContext.current
+    val locPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> vm.setUseLocation(ok) }
+    SettingRow("\uD83C\uDF10 Online", if (ui.online) "On: weather, news and look-ups" else "Off: nothing leaves this phone") {
+        Switch(checked = ui.online, onCheckedChange = { vm.setOnline(it) })
+    }
+    Hint("Also in the person-button quick menu at the top of the chat. When Online, only the words of a weather, news or look-up question " +
+        "(or your city) are sent to Open-Meteo, BBC News, Google News, Wikipedia or DuckDuckGo. Your chats never are.")
+    HorizontalDivider(Modifier.padding(vertical = 4.dp))
+    SectionTitle("Weather city")
+    var city by remember(ui.homeCity) { mutableStateOf(ui.homeCity) }
+    OutlinedTextField(value = city, onValueChange = { city = it.take(60) }, singleLine = true, label = { Text("City") }, modifier = Modifier.fillMaxWidth())
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Button(onClick = { vm.setHomeCity(city) }, enabled = city.trim() != ui.homeCity) { Text("Save") }
+        if (ui.homeCity.isNotEmpty()) OutlinedButton(onClick = { city = ""; vm.setHomeCity("") }) { Text("Clear") }
+    }
+    SettingRow("Use approximate location", "Only for weather, if no city is saved") {
+        Switch(checked = ui.useLocation, onCheckedChange = { on ->
+            if (!on) vm.setUseLocation(false)
+            else if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED) vm.setUseLocation(true)
+            else locPerm.launch(Manifest.permission.ACCESS_COARSE_LOCATION)
+        })
+    }
+    HorizontalDivider(Modifier.padding(vertical = 4.dp))
+    Hint("Chats, memory, voices and the AI model stay on this phone. Downloads and update checks use the internet only for the files themselves.")
+}
+
+@Composable
+private fun AboutPage() {
+    val ctx = LocalContext.current
+    Text("Aurora Companion \u00B7 ${com.aurora.companion.android.Edition.NAME}", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+    Hint("Version ${com.aurora.companion.android.Updater.currentVersionName(ctx)}")
+    Text("A private AI companion that runs on this phone.", fontSize = 14.sp)
+    Hint("Built with llama.cpp and sherpa-onnx (Piper voices). AI models and voices are third-party; each license is shown before download.")
+    Hint("github.com/${com.aurora.companion.android.Edition.UPDATE_REPO}")
 }
 
 // ---------------------------------------------------------------- full-screen avatar ----------------------------------------------------------------
@@ -603,7 +884,7 @@ fun SettingsScreen(ui: UiState, vm: AuroraViewModel, sizing: Sizing, onClose: ()
 @Composable
 fun CompanionBackdrop(companion: CompanionProfile, state: String, animate: Boolean, modifier: Modifier) {
     BoxWithConstraints(modifier.clipToBounds().background(Color.Black)) {
-        if (!companion.hasClips) {
+        if (!companion.animated()) {
             Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF10131C), Color(0xFF1B1433), Color.Black))))
             Text("A", style = TextStyle(brush = AuroraBrush, fontSize = fixedSp(maxWidth.value * 0.5f), fontWeight = FontWeight.Bold),
                 modifier = Modifier.align(Alignment.TopCenter).padding(top = maxHeight * 0.12f))
@@ -611,11 +892,12 @@ fun CompanionBackdrop(companion: CompanionProfile, state: String, animate: Boole
         }
         val bw = maxWidth; val bh = maxHeight
         // Clip size: width w, height w * aspect. Cover the box.
-        val scale = maxOf(bw.value, bh.value / companion.aspect)
+        val fr = companion.framing()
+        val scale = maxOf(bw.value, bh.value / fr.aspect)
         val w = scale.dp
-        val h = (scale * companion.aspect).dp
+        val h = (scale * fr.aspect).dp
         val left = (bw - w) / 2
-        val top = (bh * 0.30f - h * companion.faceY).coerceIn(bh - h, 0.dp)
+        val top = (bh * 0.30f - h * fr.faceY).coerceIn(bh - h, 0.dp)
         val frame = Modifier.wrapContentSize(Alignment.TopStart, unbounded = true).requiredSize(w, h).offset(x = left, y = top)
         rememberAssetBitmap(companion.still())?.let {
             androidx.compose.foundation.Image(it, contentDescription = companion.name, contentScale = ContentScale.FillBounds, modifier = frame)

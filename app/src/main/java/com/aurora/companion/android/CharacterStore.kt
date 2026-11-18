@@ -141,6 +141,7 @@ object CharacterStore {
         val avatar = p.optString("avatar").lowercase()
         val look = when {
             Companions.builtIns.any { it.id == avatar && it.hasClips } -> avatar
+            Companions.knownLook(avatar) -> avatar   // 0.9.5: a look from an avatar pack (Settings > Companion > Avatars)
             kind == "pet" && petType.equals("cat", true) -> "leo"
             kind == "pet" && petType.equals("dog", true) -> "barry"
             gender.equals("male", true) -> "ben"
@@ -148,6 +149,8 @@ object CharacterStore {
             else -> "aurora"
         }
         if (avatar.isNotEmpty() && avatar != look) notes += "The desktop avatar \"$avatar\" isn't on Android, so the closest built-in look was picked. You can change it."
+        if (avatar.isNotEmpty() && avatar == look && !Companions.builtIns.any { it.id == look } && !AvatarPacks.has(look))
+            notes += "The \"$avatar\" look is an avatar pack: download it in Settings > Companion > Avatars to see it animated."
         val adult = p.optBoolean("nsfw_mode") || p.optString("age_group") == "over18" && p.optBoolean("nsfw_mode") ||
             p.optString("relationship_style") == "romantic" || ADULT.containsMatchIn(personality)
         if (p.optString("voice").isNotEmpty() && p.optString("voice") != "null") notes += "Desktop voice \"${p.optString("voice")}\" isn't available offline here; pick an Android voice below."

@@ -30,7 +30,8 @@ data class UpdateInfo(
  * "<apk>.sha256" asset, or (3) a line in the release notes naming the APK with its 64-hex SHA-256.
  */
 object UpdateLogic {
-    const val REPO = "robertlionhart-cyber/aurora-companion-android"
+    /** 0.9.9: per edition (Family: aurora-companion-android, Unlocked: aurora-companion-unlocked). */
+    const val REPO = Edition.UPDATE_REPO
     const val API_URL = "https://api.github.com/repos/$REPO/releases?per_page=15"
 
     private val HEX64 = Regex("""\b[0-9a-fA-F]{64}\b""")

@@ -36,7 +36,10 @@ import com.aurora.companion.android.UiState
 /** Which clip to show for the current app state. */
 fun avatarState(ui: UiState): String {
     val last = ui.messages.lastOrNull()
+    val emo = ui.emotion
     return when {
+        // 0.9.5: a short emotion clip (from the reply's [mood] tag or keywords) wins over speaking / idle.
+        emo != null && !ui.listening && !ui.callHearing && !ui.transcribing -> emo
         ui.speaking -> Companions.STATE_SPEAKING
         ui.transcribing -> Companions.STATE_THINKING
         ui.generating && (last == null || last.isUser || last.text.isEmpty()) -> Companions.STATE_THINKING
@@ -47,11 +50,31 @@ fun avatarState(ui: UiState): String {
     }
 }
 
+/**
+ * 0.9.5: [avatarState] plus "sleeping" after [SLEEP_AFTER_MS] of idle, when the look has a sleeping clip.
+ */
+@Composable
+fun rememberAvatarState(ui: UiState): String {
+    val base = avatarState(ui)
+    val canSleep = ui.companion.hasClip(Companions.STATE_SLEEPING)
+    var asleep by remember { mutableStateOf(false) }
+    LaunchedEffect(base, canSleep, ui.messages.size, ui.companionId) {
+        asleep = false
+        if (base == Companions.STATE_IDLE && canSleep) { kotlinx.coroutines.delay(SLEEP_AFTER_MS); asleep = true }
+    }
+    return if (asleep && base == Companions.STATE_IDLE) Companions.STATE_SLEEPING else base
+}
+
+const val SLEEP_AFTER_MS = 90_000L
+
 @Composable
 fun rememberAssetBitmap(path: String): ImageBitmap? {
     val ctx = LocalContext.current
     return remember(path) {
-        runCatching { ctx.assets.open(path).use { BitmapFactory.decodeStream(it)?.asImageBitmap() } }.getOrNull()
+        runCatching {
+            if (path.startsWith("/")) BitmapFactory.decodeFile(path)?.asImageBitmap()   // 0.9.5: avatar pack file
+            else ctx.assets.open(path).use { BitmapFactory.decodeStream(it)?.asImageBitmap() }
+        }.getOrNull()
     }
 }
 
@@ -74,14 +97,15 @@ fun CompanionAvatar(
     var m = modifier.size(size).clip(CircleShape).background(Color.Black)
     if (ring != null) m = m.border(BorderStroke(ringWidth, ring), CircleShape)
     Box(m, contentAlignment = Alignment.Center) {
-        if (!companion.hasClips) {
+        if (!companion.animated()) {
             Text("A", style = TextStyle(brush = AuroraBrush, fontSize = (size.value * 0.5f).sp, fontWeight = FontWeight.Bold))
             return@Box
         }
-        val zoom = if (call) companion.callZoom else companion.faceZoom
-        val focus = if (call) companion.callY else companion.faceY
+        val fr = companion.framing()
+        val zoom = if (call) fr.callZoom else fr.faceZoom
+        val focus = if (call) fr.callY else fr.faceY
         val w = size * zoom
-        val h = w * companion.aspect
+        val h = w * fr.aspect
         val top = (size / 2 - h * focus).coerceIn(size - h, 0.dp)
         val frame = Modifier.wrapContentSize(Alignment.TopCenter, unbounded = true).requiredSize(w, h).offset(y = top)
         rememberAssetBitmap(companion.still())?.let {
@@ -130,7 +154,8 @@ private fun AvatarClip(assetPath: String, modifier: Modifier) {
         try {
             player.reset()
             player.setSurface(s)
-            ctx.assets.openFd(assetPath).use { fd -> player.setDataSource(fd.fileDescriptor, fd.startOffset, fd.length) }
+            if (assetPath.startsWith("/")) player.setDataSource(assetPath)   // 0.9.5: avatar pack file
+            else ctx.assets.openFd(assetPath).use { fd -> player.setDataSource(fd.fileDescriptor, fd.startOffset, fd.length) }
             player.isLooping = true
             player.setVolume(0f, 0f)
             player.setOnPreparedListener { it.start() }

@@ -42,6 +42,8 @@ sealed class Screen {
 
 data class UiState(
     val screen: Screen = Screen.Setup,
+    /** 0.9.0: model setup opened from Settings > Change AI model (full list) rather than on first run (light models only). */
+    val setupFromSettings: Boolean = false,
     val ramGb: Double = 0.0,
     val freeStorageBytes: Long = 0,
     val options: List<ModelOption> = emptyList(),
@@ -110,9 +112,28 @@ data class UiState(
     val adultMode: Boolean = false,
     // 0.8.6: in-app updates from GitHub Releases
     val update: UpdateUi = UpdateUi(),
+    // 0.9.3: chat mode (per companion), Online lookups (off by default), weather city / approximate location
+    val mode: ChatMode = Modes.DEFAULT,
+    val defaultMode: ChatMode = Modes.DEFAULT,
+    val online: Boolean = false,
+    val homeCity: String = "",
+    val useLocation: Boolean = false,
+    // 0.9.5: avatar packs + emotion clips
+    /** A short emotion clip (resolved clip name) shown for a few seconds, or null. */
+    val emotion: String? = null,
+    val packs: PacksUi = PacksUi(),
 ) {
     val companion: CompanionProfile get() = characters.firstOrNull { it.id == companionId } ?: Companions.byId(companionId)
 }
+
+/** 0.9.5: Settings > Companion > Avatars. */
+data class PacksUi(
+    val installed: Set<String> = emptySet(),
+    val revision: Int = 0,
+    val downloading: String? = null,
+    val progress: Float? = null,
+    val status: String? = null,
+)
 
 /** 0.8.6: "Check for updates" state (Settings > Updates). */
 data class UpdateUi(
@@ -191,9 +212,18 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
     private fun speakerPrefFor(c: String) = prefs.getInt("speaker_for_$c", prefs.getInt("speaker_id", DEFAULT_LIBRITTS_SPEAKER))
 
     init {
+        runCatching { AvatarPacks.init(app) }.onFailure { Log.e(TAG, "avatar packs init failed", it) }
         val chars = runCatching { CharacterStore.loadAll(app) }.getOrElse { Log.e(TAG, "characters load failed", it); emptyList() }
         Companions.custom = chars
-        _ui.update { it.copy(characters = chars) }
+        _ui.update { it.copy(characters = chars, packs = PacksUi(AvatarPacks.installed.keys, AvatarPacks.revision)) }
+        // Sideloaded packs: checked at start, then every 15 s (a cheap folder listing) so an adb push is picked up.
+        viewModelScope.launch(Dispatchers.IO) {
+            while (true) {
+                val done = runCatching { AvatarPacks.importInbox(getApplication()) }.getOrDefault(emptyList())
+                if (done.isNotEmpty()) { refreshPacks("Installed: ${done.joinToString(", ")}"); invalidateForPacks() }
+                kotlinx.coroutines.delay(15_000)
+            }
+        }
         _ui.update { it.copy(
             companionId = Companions.byId(prefs.getString("companion_id", null)).id,
             companionChosen = prefs.contains("companion_id"),
@@ -201,6 +231,9 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         ) }
         _ui.update { it.copy(bargeIn = prefs.getBoolean("barge_in", true), bargeSensitivity = prefs.getString("barge_sens", "medium") ?: "medium") }
         _ui.update { it.copy(memoryOn = prefs.getBoolean("memory_on", true), adultMode = AdultMode.enabled(app)) }
+        _ui.update { it.copy(defaultMode = Modes.byId(prefs.getString("mode_default", null)), online = prefs.getBoolean("online", false),
+            homeCity = prefs.getString("home_city", "") ?: "", useLocation = prefs.getBoolean("use_location", false)) }
+        _ui.update { it.copy(mode = modeFor(it.companionId)) }
         val savedSpeaker = speakerPrefFor(_ui.value.companionId)
         voice.speakerId = savedSpeaker
         _ui.update {
@@ -267,11 +300,20 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         // 0.8.6: optional once-a-day update check (Settings > Updates; the user can turn it off).
         _ui.update { it.copy(update = it.update.copy(autoCheck = prefs.getBoolean(PREF_UPDATE_AUTO, true), lastCheck = prefs.getLong(PREF_UPDATE_LAST, 0))) }
         if (_ui.value.update.autoCheck && System.currentTimeMillis() - _ui.value.update.lastCheck > UPDATE_CHECK_INTERVAL_MS) checkForUpdates(manual = false)
+        // 0.8.9: foreground keep-alive while a model is loaded or a call is on (Samsung froze + killed the app in the background).
+        viewModelScope.launch { _ui.collect { applyKeepAlive() } }
         // Auto-load the last used model if it is still on the device.
         // The uncensored model only loads in adult mode; otherwise fall back to a regular downloaded model.
         prefs.getString("last_model_file", null)?.let { name ->
             var f: File? = File(modelsDir, name)
-            if (ModelCatalog.isAdultOnly(name) && !_ui.value.adultMode) f = fallbackModelFile()
+            if (ModelCatalog.isRetired(name)) {
+                // 0.8.9: a model we no longer offer (Qwen2.5 1.5B): don't reopen it; point to the new pick.
+                prefs.edit().remove("last_model_file").apply()
+                f = null
+                _ui.update { it.copy(screen = Screen.Setup, setupFromSettings = true, selected = Edition.recommendedMature?.takeIf { m -> m in it.options } ?: it.selected,
+                    notice = "${ModelCatalog.byFileName(name)?.title ?: name} was replaced by a better model. " +
+                    "Pick one below (Unlocked · Smart is recommended); you can delete the old file under Other downloaded models.") }
+            } else if (ModelCatalog.isAdultOnly(name) && !_ui.value.adultMode) f = fallbackModelFile()
             else if (f != null && f.isFile && heavyUnsafe(f)) {
                 // 0.8.5: a 3B-class model froze or was closed mid-load / mid-reply last time (or was never confirmed
                 // on this <7 GB phone): open a lighter model instead of freezing again on startup.
@@ -291,14 +333,14 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         val ctx = getApplication<Application>()
         val ram = ModelCatalog.totalRamGb(ctx)
         val free = StatFs(ctx.filesDir.path).availableBytes
-        val done = ModelCatalog.all.filter { File(modelsDir, it.fileName).let { f -> f.isFile && f.length() == it.sizeBytes } }
+        val done = (ModelCatalog.all + ModelCatalog.retired).filter { File(modelsDir, it.fileName).let { f -> f.isFile && f.length() == it.sizeBytes } }
             .map { it.id }.toSet()
         _ui.update {
             it.copy(
                 ramGb = ram,
                 freeStorageBytes = free,
-                options = ModelCatalog.available(ram, it.adultMode),
-                selected = if (it.selected in ModelCatalog.available(ram, it.adultMode)) it.selected else ModelCatalog.recommended(ram),
+                options = ModelCatalog.available(ram),
+                selected = if (it.selected in ModelCatalog.available(ram)) it.selected else ModelCatalog.recommended(ram),
                 downloaded = done,
             )
         }
@@ -482,7 +524,7 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
                 Log.e(TAG, "load failed", e)
                 prefs.edit().remove(PREF_PENDING).apply()
                 withContext(NonCancellable + Dispatchers.IO) { runCatching { engine.cleanUp() } }
-                val heavyHint = if (file.length() >= ModelCatalog.HEAVY_BYTES) " This model may be too big for this phone; try a smaller one (Qwen2.5 1.5B or a 1B)." else ""
+                val heavyHint = if (file.length() >= ModelCatalog.HEAVY_BYTES) " This model may be too big for this phone; try a lighter one (Family · Light or Unlocked · Light)." else ""
                 _ui.update { it.copy(screen = Screen.Setup, error = "Could not load the model: ${e.message ?: e.javaClass.simpleName}.$heavyHint") }
             }
         }
@@ -490,10 +532,51 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
 
     /** The persona plus the compact running-memory block (about 300 tokens at most). */
     private fun fullSystemPrompt(comp: CompanionProfile): String {
-        val base = comp.systemPrompt(_ui.value.adultMode)
+        val base = comp.systemPrompt(_ui.value.adultMode, effectiveMode(comp)) + moodPrompt(comp)
         if (!_ui.value.memoryOn) return base
         val notes = runCatching { MemoryStore.load(getApplication(), comp.id) }.getOrDefault(emptyList())
         return base + MemoryStore.promptBlock(notes)
+    }
+
+    /** 0.9.5: mood tags for the avatar's emotion clips (only when the look has some and animation is on). */
+    private fun moodTags(comp: CompanionProfile): List<String> =
+        if (_ui.value.animateAvatar) AvatarPacks.emotionTags(comp.look) else emptyList()
+
+    private fun moodPrompt(comp: CompanionProfile): String {
+        val tags = moodTags(comp)
+        if (tags.isEmpty()) return ""
+        return "\nStart every reply with one mood tag in square brackets that fits your feeling, picked from: " +
+            tags.joinToString(", ") { "[$it]" } + ". Then write your reply. The tag only moves your avatar; never mention or explain it."
+    }
+
+    /** Strips a leading "[mood]" tag from the streamed reply (and reports it). */
+    private class MoodFilter(active: Boolean) {
+        private val buf = StringBuilder()
+        private var decided = !active
+        var tag: String? = null; private set
+        fun push(t: String): String {
+            if (decided) return t
+            buf.append(t)
+            val s = buf.toString()
+            val tr = s.trimStart()
+            if (tr.isEmpty()) return ""
+            if (tr[0] != '[') { decided = true; return s }
+            val close = tr.indexOf(']')
+            if (close < 0) { if (tr.length > 26) { decided = true; return s }; return "" }
+            tag = tr.substring(1, close).trim()
+            decided = true
+            return tr.substring(close + 1).trimStart()
+        }
+        fun flush(): String { if (decided) return ""; decided = true; return buf.toString() }
+    }
+
+    private var emotionJob: Job? = null
+
+    /** Shows [clip] for a few seconds (0.9.5). */
+    private fun showEmotion(clip: String) {
+        emotionJob?.cancel()
+        _ui.update { it.copy(emotion = clip) }
+        emotionJob = viewModelScope.launch { kotlinx.coroutines.delay(EMOTION_MS); _ui.update { it.copy(emotion = null) } }
     }
 
     /** The newest messages that fit in [budget] tokens, oldest first, for rebuilding the context. */
@@ -549,19 +632,29 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         // Reminders by chat / voice (desktop: try_complete / try_parse_reminder_command / user_asks_schedule).
         // The llama.cpp system prompt is fixed after load, so the app's note rides along with this one user turn.
         val note = runCatching { reminderChat(msg) }.getOrNull()
+        val goOnline = note == null && _ui.value.online
+        if (note == null && !_ui.value.online && !offlineTipShown) {
+            val i = OnlineTools.detect(msg)
+            if (i is OnlineTools.Intent.Weather || i is OnlineTools.Intent.News) {
+                offlineTipShown = true
+                _ui.update { it.copy(notice = "\uD83C\uDF10 Offline. Tap the globe at the top to look up weather and news.") }
+            }
+        }
         val useBooks = note == null && _ui.value.bookKnowledge && _ui.value.libraryTask == null && _ui.value.library.indexedBooks > 0
         genJob = viewModelScope.launch {
             val sb = StringBuilder()
             val splitter = SentenceSplitter()
             val speakEpoch = voice.currentEpoch()
             try {
+                // 0.9.3: Online lookups (only when the globe is on): a compact result rides along in the hidden note.
+                val online = if (!goOnline) null else withContext(Dispatchers.IO) { onlineNote(msg) }
                 // Book library (0.8): up to 3 short passages (~1,200 chars) ride along in the same hidden note.
-                val books = if (!useBooks) null else withContext(Dispatchers.IO) {
+                val books = if (!useBooks || online != null) null else withContext(Dispatchers.IO) {
                     runCatching { Library.retrieveForChat(getApplication(), msg, BOOK_NOTE_BUDGET) }
                         .onFailure { Log.e(TAG, "book retrieval failed", it) }.getOrNull()
                 }
                 if (books != null) _ui.update { it.copy(notice = "\uD83D\uDCDA From the library: " + books.second.joinToString(", ")) }
-                val hidden = note ?: books?.first
+                val hidden = note ?: online ?: books?.first ?: _ui.value.companion.identityNote(msg)
                 val prompt = (if (hidden != null) "(App note, not said by the user: $hidden)\n\n$msg" else msg).take(MAX_PROMPT_CHARS)
                 llm.withLock {
                     // 0.8.5: marked while replying, so a freeze / force-close mid-reply on a 3B model is caught at startup.
@@ -608,12 +701,32 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
                     _ui.update { it.copy(preparing = null) }
                 }
                 makeRoom(prompt)
-                engine.sendUserPrompt(prompt, MAX_REPLY_TOKENS).collect { token ->
-                    sb.append(token)
-                    if (_ui.value.autoSpeak || _ui.value.inCall) splitter.push(token).forEach { enqueueSpeech(it, speakEpoch) }
-                    val t = sb.toString()
-                    _ui.update { s -> s.copy(messages = s.messages.map { if (it.id == replyId) it.copy(text = t) else it }) }
+                val look = _ui.value.companion.look
+                val moodOn = moodTags(_ui.value.companion).isNotEmpty()
+                val emoOn = _ui.value.animateAvatar && AvatarPacks.has(look)
+                val mood = MoodFilter(moodOn)
+                var shown = false
+                var kwChecked = false
+                val handle: (String) -> Unit = { out ->
+                    if (out.isNotEmpty()) {
+                        sb.append(out)
+                        if (_ui.value.autoSpeak || _ui.value.inCall) splitter.push(out).forEach { enqueueSpeech(it, speakEpoch) }
+                        val t = if (moodOn) AvatarPacks.TAG_RE.replace(sb, "") else sb.toString()
+                        _ui.update { s -> s.copy(messages = s.messages.map { if (it.id == replyId) it.copy(text = t) else it }) }
+                    }
                 }
+                engine.sendUserPrompt(prompt, MAX_REPLY_TOKENS).collect { token ->
+                    val out = mood.push(token)
+                    if (!shown && emoOn) mood.tag?.let { tg -> AvatarPacks.resolve(look, tg)?.let { shown = true; showEmotion(it) } }
+                    handle(out)
+                    // Keyword fallback once the first sentence is in.
+                    if (!shown && emoOn && !kwChecked && mood.tag == null && (sb.length > 80 || sb.indexOfAny(charArrayOf('.', '!', '?')) >= 0)) {
+                        kwChecked = true
+                        AvatarPacks.fromKeywords(look, sb.toString())?.let { shown = true; showEmotion(it) }
+                    }
+                }
+                handle(mood.flush())
+                if (!shown && emoOn && sb.isNotEmpty()) AvatarPacks.fromKeywords(look, sb.toString())?.let { showEmotion(it) }
                 return
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
@@ -666,9 +779,91 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stop() { genJob?.cancel() }
 
+    // ---------- 0.9.3: chat modes ----------
+    private fun modeFor(companionId: String): ChatMode =
+        prefs.getString("mode_$companionId", null)?.let { Modes.byId(it) } ?: Modes.byId(prefs.getString("mode_default", null))
+
+    /** The mode actually used: an 18+ mode falls back to Best Friend while adult mode is off (or for the animals). */
+    private fun effectiveMode(comp: CompanionProfile): ChatMode {
+        val m = _ui.value.mode
+        return if (m in Modes.available(_ui.value.adultMode, comp)) m else Modes.DEFAULT
+    }
+
+    /** Chip at the top of the chat. Remembered per companion; applies from the next reply (the context is rebuilt). */
+    fun setMode(m: ChatMode) {
+        val comp = _ui.value.companion
+        prefs.edit().putString("mode_${comp.id}", m.id).apply()
+        if (m == _ui.value.mode) return
+        _ui.update { it.copy(mode = m, notice = "${m.emoji} ${m.label} mode - from the next reply") }
+        if (_ui.value.loadedModelName != null) viewModelScope.launch { llm.withLock { chatValid = false } }
+    }
+
+    /** Settings > Companion: the mode a companion starts in until you pick one for it. */
+    fun setDefaultMode(m: ChatMode) {
+        prefs.edit().putString("mode_default", m.id).apply()
+        _ui.update { it.copy(defaultMode = m) }
+    }
+
+    // ---------- 0.9.3: Online (globe) ----------
+    @Volatile private var awaitingCity = false
+    private var offlineTipShown = false
+
+    fun setOnline(on: Boolean) {
+        prefs.edit().putBoolean("online", on).apply()
+        _ui.update { it.copy(online = on, notice = if (on) "\uD83C\uDF10 Online: weather, news and look-ups. Only your search words are sent."
+            else "Offline: nothing leaves this phone.") }
+    }
+
+    fun setHomeCity(city: String) {
+        val c = city.trim().take(60)
+        prefs.edit().putString("home_city", c).apply()
+        _ui.update { it.copy(homeCity = c) }
+    }
+
+    /** Only after the user allowed approximate location (Settings > Privacy & online). */
+    fun setUseLocation(on: Boolean) {
+        prefs.edit().putBoolean("use_location", on).apply()
+        _ui.update { it.copy(useLocation = on) }
+    }
+
+    @android.annotation.SuppressLint("MissingPermission")
+    private fun coarseLocation(): Pair<Double, Double>? {
+        val ctx = getApplication<Application>()
+        if (androidx.core.content.ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.ACCESS_COARSE_LOCATION)
+            != android.content.pm.PackageManager.PERMISSION_GRANTED) return null
+        val lm = ctx.getSystemService(android.location.LocationManager::class.java) ?: return null
+        val loc = runCatching {
+            lm.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER)
+                ?: lm.getLastKnownLocation(android.location.LocationManager.PASSIVE_PROVIDER)
+        }.getOrNull() ?: return null
+        // Rounded to ~10 km before it goes anywhere.
+        return Math.round(loc.latitude * 10) / 10.0 to Math.round(loc.longitude * 10) / 10.0
+    }
+
+    /** Runs on Dispatchers.IO. Returns the note for this turn, or null when the message isn't a look-up. */
+    private fun onlineNote(msg: String): String? {
+        var intent = OnlineTools.detect(msg)
+        if (intent == null && awaitingCity) OnlineTools.cityFromReply(msg)?.let { intent = OnlineTools.Intent.Weather(it, false) }
+        awaitingCity = false
+        val i = intent ?: return null
+        _ui.update { it.copy(preparing = "\uD83C\uDF10 Looking that up...") }
+        val saved = _ui.value.homeCity.ifBlank { null }
+        val coords = if (i is OnlineTools.Intent.Weather && i.city == null && saved == null && _ui.value.useLocation) coarseLocation() else null
+        val r = OnlineTools.run(i, saved, coords)
+        if (r.needsCity) awaitingCity = true
+        val newCity = r.city
+        if (r.ok && newCity != null && _ui.value.homeCity.isBlank()) setHomeCity(newCity)
+        _ui.update { it.copy(preparing = null, notice = when {
+            r.ok && r.source.isNotEmpty() -> "\uD83C\uDF10 From ${r.source}"
+            !r.ok && r.source == "offline" -> "\uD83C\uDF10 Couldn't get online - answering offline."
+            else -> it.notice
+        }) }
+        return r.note
+    }
+
     private fun enqueueSpeech(text: String, epoch: Int) {
         if (!voice.ttsReady) return
-        val clean = VoiceEngine.cleanForSpeech(text)
+        val clean = VoiceEngine.cleanForSpeech(AvatarPacks.TAG_RE.replace(text, " ").trim())
         if (clean.isEmpty()) return
         pendingSpeech.incrementAndGet()
         _ui.update { it.copy(speaking = true) }
@@ -1070,6 +1265,7 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
     fun setAnimateAvatar(on: Boolean) {
         prefs.edit().putBoolean("animate_avatar", on).apply()
         _ui.update { it.copy(animateAvatar = on) }
+        invalidateForPacks()
     }
 
     /**
@@ -1093,7 +1289,7 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         val c = Companions.byId(id)
         val changed = c.id != _ui.value.companionId || !_ui.value.companionChosen
         prefs.edit().putString("companion_id", c.id).apply()
-        _ui.update { it.copy(companionId = c.id, companionChosen = true, memoryNotes = emptyList()) }
+        _ui.update { it.copy(companionId = c.id, companionChosen = true, memoryNotes = emptyList(), mode = modeFor(c.id), emotion = null) }
         if (!changed) return false
         if (_ui.value.inCall) endCall()
         stopSpeaking()
@@ -1207,7 +1403,7 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         refreshCharacters()
         runCatching { MemoryStore.wipe(getApplication(), id) }
         _ui.update { it.copy(editor = null, notice = "Deleted ${c.name}") }
-        if (wasCurrent) selectCompanion(Companions.look(c.look).id)
+        if (wasCurrent) selectCompanion(Companions.builtIns.firstOrNull { it.id == c.look }?.id ?: Companions.AURORA.id)
     }
 
     private fun exportBytes(id: String, card: Boolean): Pair<String, ByteArray>? {
@@ -1510,6 +1706,91 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // ---------- 0.9.5: avatar packs ----------
+
+    private var packJob: Job? = null
+
+    private fun refreshPacks(status: String? = _ui.value.packs.status) {
+        _ui.update { it.copy(packs = it.packs.copy(installed = AvatarPacks.installed.keys, revision = AvatarPacks.revision, status = status)) }
+        // Characters keep their look; their framing and clips are resolved live from the installed packs.
+        val chars = runCatching { CharacterStore.loadAll(getApplication()) }.getOrNull()
+        if (chars != null) { Companions.custom = chars; _ui.update { it.copy(characters = chars) } }
+    }
+
+    /** The mood-tag prompt depends on the current look's packs, so the context is rebuilt on the next message. */
+    private fun invalidateForPacks() {
+        if (_ui.value.loadedModelName != null) viewModelScope.launch { llm.withLock { chatValid = false } }
+    }
+
+    fun downloadPack(id: String) {
+        val p = AvatarPacks.info(id) ?.takeIf { it.hosted } ?: return
+        if (packJob?.isActive == true) return
+        packJob = viewModelScope.launch {
+            _ui.update { it.copy(packs = it.packs.copy(downloading = id, progress = 0f, status = null)) }
+            val dest = File(getApplication<Application>().cacheDir, "packdl/${p.file}").apply { parentFile?.mkdirs() }
+            try {
+                httpDownload(p.url, dest, p.size) { f -> _ui.update { it.copy(packs = it.packs.copy(progress = f)) } }
+                withContext(Dispatchers.IO) { AvatarPacks.install(dest, p) }
+                dest.delete()
+                refreshPacks("${p.name} installed.")
+                invalidateForPacks()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Log.e(TAG, "pack download failed", e)
+                if (e !is java.io.IOException) dest.delete()
+                refreshPacks("Couldn't get ${p.name}: ${e.message ?: e.javaClass.simpleName}")
+            } finally {
+                _ui.update { it.copy(packs = it.packs.copy(downloading = null, progress = null)) }
+            }
+        }
+    }
+
+    fun cancelPackDownload() { packJob?.cancel() }
+
+    fun deletePack(id: String) {
+        val p = AvatarPacks.info(id) ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            AvatarPacks.delete(id)
+            refreshPacks("${p.name} removed.")
+            invalidateForPacks()
+        }
+    }
+
+    /** Sideloaded zips in Android/data/<app>/files/avatarpacks_inbox (checksum-verified). */
+    fun importPackInbox(quiet: Boolean = false) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val done = runCatching { AvatarPacks.importInbox(getApplication()) }.getOrDefault(emptyList())
+            if (done.isNotEmpty()) { refreshPacks("Installed: ${done.joinToString(", ")}"); invalidateForPacks() }
+            else if (!quiet) refreshPacks()
+        }
+    }
+
+    /** "Import from file": a pack zip picked with the system file picker (must match a catalog checksum). */
+    fun importPackFile(uri: android.net.Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val app = getApplication<Application>()
+            val tmp = File(app.cacheDir, "packdl/import.zip").apply { parentFile?.mkdirs() }
+            try {
+                var n = 0L
+                app.contentResolver.openInputStream(uri)?.use { input ->
+                    tmp.outputStream().use { out ->
+                        val buf = ByteArray(1 shl 16)
+                        while (true) { val k = input.read(buf); if (k < 0) break; n += k; if (n > 40L * 1024 * 1024) throw IllegalStateException("file too large"); out.write(buf, 0, k) }
+                    }
+                } ?: throw IllegalStateException("couldn't open the file")
+                val m = AvatarPacks.install(tmp, null)
+                refreshPacks("${m.name} installed.")
+                invalidateForPacks()
+            } catch (e: Throwable) {
+                Log.e(TAG, "pack import failed", e)
+                refreshPacks("Import failed: ${e.message ?: e.javaClass.simpleName}")
+            } finally {
+                tmp.delete()
+            }
+        }
+    }
+
     private fun sha256(f: File): String {
         val md = java.security.MessageDigest.getInstance("SHA-256")
         f.inputStream().use { input ->
@@ -1607,7 +1888,7 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) { llm.withLock { runCatching { engine.cleanUp() } } }
         refreshDevice()
         saveConversation()
-        _ui.update { it.copy(screen = Screen.Setup, loadedModelName = null, messages = emptyList()) }
+        _ui.update { it.copy(screen = Screen.Setup, setupFromSettings = true, loadedModelName = null, messages = emptyList()) }
         beginConversation(HistoryStore.MODE_CHAT, 0)
     }
 
@@ -1668,9 +1949,9 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         if (!on && loaded == null && ModelCatalog.isAdultOnly(prefs.getString("last_model_file", null))) {
             prefs.edit().remove("last_model_file").apply()
         }
-        // An adult-flagged character's rules change: rebuild the model's context before the next reply.
+        // An adult-flagged character's rules change (or an 18+ mode turns on/off): rebuild the context before the next reply.
         val comp = _ui.value.companion
-        if (comp.custom && comp.adultFlagged && loaded != null) viewModelScope.launch { llm.withLock { chatValid = false } }
+        if (((comp.custom && comp.adultFlagged) || _ui.value.mode.adultOnly) && loaded != null) viewModelScope.launch { llm.withLock { chatValid = false } }
         _ui.update { it.copy(notice = if (on) "Adult mode on (18+)" else "Adult mode off - family-friendly everywhere") }
     }
 
@@ -1752,7 +2033,24 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         runCatching { Updater.install(app, f) }.onFailure { e -> _ui.update { it.copy(update = it.update.copy(status = "Couldn't open the installer: ${e.message}")) } }
     }
 
+    // ---------- 0.8.9: keep-alive ----------
+    private var keepAliveKey: Triple<Boolean, Boolean, String?>? = null
+
+    private fun applyKeepAlive(force: Boolean = false) {
+        val s = _ui.value
+        val on = s.loadedModelName != null || s.inCall
+        val key = Triple(on, s.inCall, s.loadedModelName)
+        if (!force && key == keepAliveKey) return
+        if (force && !on) return
+        keepAliveKey = key
+        KeepAliveService.update(getApplication(), on, s.inCall, ModelCatalog.byFileName(s.loadedModelName)?.title ?: s.loadedModelName)
+    }
+
+    /** The app is visible again: re-apply the keep-alive (Android refuses to start it from the background). */
+    fun onAppForeground() = applyKeepAlive(force = true)
+
     override fun onCleared() {
+        runCatching { KeepAliveService.update(getApplication(), false, false, null) }
         runCatching { saveConversation(sync = true) }
         memJob?.cancel()
         runCatching { call.release() }
@@ -1763,6 +2061,8 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     companion object {
+        /** 0.9.5: how long an emotion clip shows. */
+        const val EMOTION_MS = 4_500L
         private const val TAG = "AuroraVM"
         private const val MAX_REPLY_TOKENS = 384
         /** Context rebuilds (Continue, recovery, after a memory pass) keep about this many tokens of recent chat. */

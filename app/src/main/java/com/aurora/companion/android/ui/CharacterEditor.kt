@@ -11,6 +11,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -84,10 +85,10 @@ fun CharacterEditor(ui: UiState, vm: AuroraViewModel, sizing: Sizing, start: Cha
             OutlinedTextField(name, { name = it.take(40) }, label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
 
             Text("Look", fontWeight = FontWeight.SemiBold)
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())) {
                 Companions.looks.forEach { l ->
                     val on = l.id == look
-                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1f).clickable { look = l.id }) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(if (sizing.wide) 84.dp else 62.dp).clickable { look = l.id }) {
                         CompanionAvatar(l, Companions.STATE_IDLE, if (sizing.wide) 72.dp else 52.dp, animate = false,
                             ring = if (on) AuroraTeal else null, ringWidth = 3.dp)
                         Text(l.name, fontSize = 12.sp, color = if (on) AuroraTeal else MaterialTheme.colorScheme.onSurfaceVariant)
