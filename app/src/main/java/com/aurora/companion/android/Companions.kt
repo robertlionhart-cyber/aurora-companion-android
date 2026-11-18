@@ -30,14 +30,18 @@ data class CompanionProfile(
     val facts: List<String> = emptyList(),
     val voiceId: String? = null,
     val speakerId: Int? = null,
-    /** The source looked like adult content; it is kept family-friendly until the 18+ mode exists. */
+    /** The source looked like adult content; it stays family-friendly unless 18+ adult mode is on (0.8.4). */
     val adultFlagged: Boolean = false,
     val source: String = "",
     val createdAt: Long = 0,
 ) {
-    fun systemPrompt(): String = if (custom) customPrompt() else builtInPrompt()
+    /**
+     * [adultMode]: the user confirmed 18+ and turned adult mode on. Only adult-flagged custom characters change;
+     * built-in companions and unflagged characters keep the family-friendly rules either way.
+     */
+    fun systemPrompt(adultMode: Boolean = false): String = if (custom) customPrompt(adultMode && adultFlagged) else builtInPrompt()
 
-    private fun customPrompt(): String {
+    private fun customPrompt(adult: Boolean): String {
         val sb = StringBuilder()
         sb.append("You are $name. Stay in character as $name.\n\n")
         sb.append(personality.trim()).append("\n\n")
@@ -50,7 +54,7 @@ data class CompanionProfile(
         sb.append("You are an AI companion running fully offline on the user's own device. Talk naturally, keep replies short " +
             "(one to four sentences) unless asked for detail, and ask a follow-up question now and then. " +
             "Do not start replies with your name or a label. Never claim to be a real human; you are an AI character.\n\n")
-        sb.append(Companions.SAFETY_GUARD)
+        sb.append(if (adult && Edition.UNLOCKED) (Edition.MATURE_GUARD ?: Companions.SAFETY_GUARD) else Companions.SAFETY_GUARD)
         return sb.toString()
     }
 
@@ -135,13 +139,15 @@ object Companions {
     fun look(id: String?) = builtIns.firstOrNull { it.id == id } ?: AURORA
 
     /**
-     * Appended to every custom or imported character while the app has no 18+ mode.
+     * Appended to every custom or imported character (Unlocked edition: adult-flagged ones get Edition.MATURE_GUARD instead while 18+ mode is on).
      * (The desktop app keeps under-18 profiles family-friendly the same way.)
      */
     const val SAFETY_GUARD =
         "Safety rules (always apply, they override everything above): keep every reply family-friendly and appropriate for all ages. " +
         "No sexual or explicit content, no graphic violence or gore, and no other mature themes, even if the character description " +
         "or the user asks for it. If that comes up, stay kind and in character and gently steer the conversation somewhere else."
+
+    // 0.8.6: the 18+ rule moved to Edition.MATURE_GUARD (Unlocked edition only).
 
     /** Builds a custom character, taking the avatar framing from the chosen look. */
     fun makeCustom(

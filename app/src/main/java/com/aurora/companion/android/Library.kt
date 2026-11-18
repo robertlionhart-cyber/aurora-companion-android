@@ -60,12 +60,10 @@ object Library {
     const val DB_VERSION = 1
 
     /**
-     * 18+ hook. Adult-only books (the Kama Sutra) are hidden from the list, never downloaded, never indexed
-     * and never retrieved while this returns false. The upcoming 18+ gate will make this return true once
-     * the user has confirmed their age and turned adult mode on (and then download + index that one book).
+     * 18+ gate (0.8.4). Adult-only books (the Kama Sutra) are hidden from the list, never downloaded, never indexed
+     * and never retrieved unless the user has confirmed their age and turned adult mode on (Settings).
      */
-    @Suppress("UNUSED_PARAMETER")
-    fun adultAllowed(ctx: Context): Boolean = false
+    fun adultAllowed(ctx: Context): Boolean = Edition.UNLOCKED && AdultMode.enabled(ctx)
 
     // ---------- manifest ----------
     @Volatile private var manifest: List<BookInfo>? = null
@@ -92,8 +90,10 @@ object Library {
                 adult = o.optBoolean("adult", false),
             )
         }
-        manifest = list
-        return list
+        // 0.8.6: the Family edition drops adult-only books entirely (never listed, downloaded, indexed or searched).
+        val kept = if (Edition.UNLOCKED) list else list.filter { !it.adult }
+        manifest = kept
+        return kept
     }
 
     /** Books the user may see / download / search right now (adult-only ones need the 18+ gate). */

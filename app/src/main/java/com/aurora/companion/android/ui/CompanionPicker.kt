@@ -121,7 +121,9 @@ fun CompanionPicker(ui: UiState, vm: AuroraViewModel, sizing: Sizing, firstRun: 
                 if (sel.custom) TextButton(onClick = { showExport = true }) { Text("Export / share") }
             }
             Text("Import: Aurora companion pack (.zip) or profile (.json) from the desktop app, character cards (TavernAI / SillyTavern .json or .png), " +
-                "or personality text (.txt). Adult content needs the upcoming 18+ mode; imports are kept family-friendly.",
+                "or personality text (.txt). " + if (ui.adultMode) "Adult mode is on: imports marked as adult can use mature themes."
+                else if (!com.aurora.companion.android.Edition.UNLOCKED) "Imports are always kept family-friendly."
+                else "Imports are kept family-friendly unless 18+ adult mode is on (Settings).",
                 fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
             val switching = !firstRun && pick != ui.companionId
             if (switching && ui.loadedModelName != null) {

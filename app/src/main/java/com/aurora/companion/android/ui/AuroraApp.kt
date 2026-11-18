@@ -40,6 +40,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.aurora.companion.android.AuroraViewModel
 import com.aurora.companion.android.ChatMessage
+import com.aurora.companion.android.ModelCatalog
 import com.aurora.companion.android.ModelOption
 import com.aurora.companion.android.Screen
 import com.aurora.companion.android.UiState
@@ -130,13 +131,28 @@ fun SetupScreen(ui: UiState, vm: AuroraViewModel, sizing: Sizing) {
                 Text("This device", fontWeight = FontWeight.SemiBold)
                 Text("Memory (RAM): %.1f GB   -   Free storage: %s".format(ui.ramGb, ui.freeStorageBytes.toNiceSize()),
                     color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 14.sp)
-                if (ui.options.size < 2) Text("Larger 3B model is hidden: it needs an 8 GB device.",
+                if (ModelCatalog.LLAMA_3B !in ui.options) Text("Larger 3B models are hidden: they need a 6 GB device.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
             }
             Text("Choose a brain for Aurora", fontWeight = FontWeight.SemiBold, fontSize = (sizing.body + 1).sp)
             ui.options.forEach { opt ->
                 ModelCard(opt, selected = opt == ui.selected, downloaded = opt.id in ui.downloaded,
                     onClick = { vm.select(opt) }, onDelete = { vm.deleteModel(opt) })
+            }
+            // 0.8.5: downloaded files that aren't offered right now (e.g. an 18+ model with adult mode off) can still be deleted.
+            val hidden = ModelCatalog.all.filter { it.id in ui.downloaded && it !in ui.options }
+            if (hidden.isNotEmpty()) InfoCard {
+                Text("Other downloaded models", fontWeight = FontWeight.SemiBold)
+                hidden.forEach { opt ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(opt.title, fontSize = 14.sp)
+                            Text("${opt.sizeBytes.toNiceSize()} on device - not available right now", fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        TextButton(onClick = { vm.deleteModel(opt) }) { Text("Delete") }
+                    }
+                }
             }
             InfoCard {
                 Text("Before you download", fontWeight = FontWeight.SemiBold)

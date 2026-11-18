@@ -4,6 +4,7 @@
 #include <cmath>
 #include <string>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <sampling.h>
 
 #include "logging.h"
@@ -31,6 +32,8 @@ constexpr int   N_THREADS_HEADROOM      = 2;
 constexpr int   DEFAULT_CONTEXT_SIZE    = 4096;
 constexpr int   OVERFLOW_HEADROOM       = 4;
 constexpr int   BATCH_SIZE              = 512;
+constexpr long long LOW_MEMORY_MODEL_BYTES = 1500000000LL;   // 3B-class GGUF files
+static bool g_low_memory = false;
 constexpr float DEFAULT_SAMPLER_TEMP    = 0.7f;
 
 static llama_model                      * g_model;
@@ -64,6 +67,16 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstr
     const auto *model_path = env->GetStringUTFChars(jmodel_path, 0);
     LOGd("%s: Loading model from: \n%s\n", __func__, model_path);
 
+    // Aurora 0.8.5: 3B-class files (~2 GB) ran a 6 GB phone out of memory: the CPU repack buffer copied 1.3 GB of
+    // weights into anonymous memory (swapped to zram, then the app froze and was killed). For big files keep the
+    // weights memory-mapped (no repack copy) and use a smaller KV cache / compute buffer.
+    struct stat st {};
+    g_low_memory = stat(model_path, &st) == 0 && (long long) st.st_size >= LOW_MEMORY_MODEL_BYTES;
+    if (g_low_memory) {
+        model_params.use_extra_bufts = false;
+        LOGi("%s: big model (%lld bytes): low-memory mode (no weight repack, q8_0 KV cache)", __func__, (long long) st.st_size);
+    }
+
     auto *model = llama_model_load_from_file(model_path, model_params);
     env->ReleaseStringUTFChars(jmodel_path, model_path);
     if (!model) {
@@ -95,6 +108,12 @@ static llama_context *init_context(llama_model *model, const int n_ctx = DEFAULT
     ctx_params.n_ctx = n_ctx;
     ctx_params.n_batch = BATCH_SIZE;
     ctx_params.n_ubatch = BATCH_SIZE;
+    if (g_low_memory) {
+        ctx_params.n_ubatch = BATCH_SIZE / 2;          // smaller compute buffer
+        ctx_params.type_k = GGML_TYPE_Q8_0;            // half-size KV cache (needs flash attention, on by default)
+        ctx_params.type_v = GGML_TYPE_Q8_0;
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
     ctx_params.n_threads = n_threads;
     ctx_params.n_threads_batch = n_threads;
     auto *context = llama_init_from_model(g_model, ctx_params);

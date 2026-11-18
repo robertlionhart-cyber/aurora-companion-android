@@ -106,9 +106,30 @@ data class UiState(
     val memoryBusy: Boolean = false,
     /** Short status while the context is being rebuilt (Continue / recovery). */
     val preparing: String? = null,
+    // 0.8.4: 18+ adult mode (off by default)
+    val adultMode: Boolean = false,
+    // 0.8.6: in-app updates from GitHub Releases
+    val update: UpdateUi = UpdateUi(),
 ) {
     val companion: CompanionProfile get() = characters.firstOrNull { it.id == companionId } ?: Companions.byId(companionId)
 }
+
+/** 0.8.6: "Check for updates" state (Settings > Updates). */
+data class UpdateUi(
+    val autoCheck: Boolean = true,
+    val checking: Boolean = false,
+    /** A newer release for this edition, once found. */
+    val info: UpdateInfo? = null,
+    /** Download progress (0..1), null while not downloading. */
+    val progress: Float? = null,
+    val downloading: Boolean = false,
+    /** Verified APK waiting to be installed. */
+    val readyPath: String? = null,
+    /** Android needs "Install unknown apps" allowed for this app first. */
+    val needsPermission: Boolean = false,
+    val status: String? = null,
+    val lastCheck: Long = 0,
+)
 
 /** What the character editor opens with (new, edit, duplicate or a reviewed import). */
 data class CharacterEdit(
@@ -179,7 +200,7 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
             animateAvatar = prefs.getBoolean("animate_avatar", true),
         ) }
         _ui.update { it.copy(bargeIn = prefs.getBoolean("barge_in", true), bargeSensitivity = prefs.getString("barge_sens", "medium") ?: "medium") }
-        _ui.update { it.copy(memoryOn = prefs.getBoolean("memory_on", true)) }
+        _ui.update { it.copy(memoryOn = prefs.getBoolean("memory_on", true), adultMode = AdultMode.enabled(app)) }
         val savedSpeaker = speakerPrefFor(_ui.value.companionId)
         voice.speakerId = savedSpeaker
         _ui.update {
@@ -243,10 +264,26 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update { it.copy(bookKnowledgeDefault = bkDefault, bookKnowledge = prefs.getBoolean("book_knowledge", bkDefault)) }
         refreshLibrary()
         refreshDevice()
+        // 0.8.6: optional once-a-day update check (Settings > Updates; the user can turn it off).
+        _ui.update { it.copy(update = it.update.copy(autoCheck = prefs.getBoolean(PREF_UPDATE_AUTO, true), lastCheck = prefs.getLong(PREF_UPDATE_LAST, 0))) }
+        if (_ui.value.update.autoCheck && System.currentTimeMillis() - _ui.value.update.lastCheck > UPDATE_CHECK_INTERVAL_MS) checkForUpdates(manual = false)
         // Auto-load the last used model if it is still on the device.
+        // The uncensored model only loads in adult mode; otherwise fall back to a regular downloaded model.
         prefs.getString("last_model_file", null)?.let { name ->
-            val f = File(modelsDir, name)
-            if (f.isFile && f.length() > 0) { if (_ui.value.companionChosen) loadModel(f) else pendingAutoLoad = f }
+            var f: File? = File(modelsDir, name)
+            if (ModelCatalog.isAdultOnly(name) && !_ui.value.adultMode) f = fallbackModelFile()
+            else if (f != null && f.isFile && heavyUnsafe(f)) {
+                // 0.8.5: a 3B-class model froze or was closed mid-load / mid-reply last time (or was never confirmed
+                // on this <7 GB phone): open a lighter model instead of freezing again on startup.
+                val alt = lightModelFile()
+                Log.w(TAG, "not auto-loading heavy model $name (pending=${prefs.getString(PREF_PENDING, null)}), using ${alt?.name}")
+                prefs.edit().remove(PREF_PENDING).apply()
+                _ui.update { it.copy(notice = "${ModelCatalog.byFileName(name)?.title ?: name} may be too big for this phone (it didn't finish last time), " +
+                    "so ${if (alt != null) "I opened ${ModelCatalog.byFileName(alt.name)?.title ?: alt.name} instead" else "pick a smaller model"}. " +
+                    "You can switch back under Change AI model.") }
+                f = alt
+            }
+            if (f != null && f.isFile && f.length() > 0) { if (_ui.value.companionChosen) loadModel(f) else pendingAutoLoad = f }
         }
     }
 
@@ -260,8 +297,8 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
             it.copy(
                 ramGb = ram,
                 freeStorageBytes = free,
-                options = ModelCatalog.available(ram),
-                selected = if (it.selected in ModelCatalog.available(ram)) it.selected else ModelCatalog.recommended(ram),
+                options = ModelCatalog.available(ram, it.adultMode),
+                selected = if (it.selected in ModelCatalog.available(ram, it.adultMode)) it.selected else ModelCatalog.recommended(ram),
                 downloaded = done,
             )
         }
@@ -273,6 +310,7 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
     /** Downloads the selected model (user already consented in the UI), resuming if partial. */
     fun downloadSelected() {
         val opt = _ui.value.selected
+        if (opt.adultOnly && !_ui.value.adultMode) { _ui.update { it.copy(error = "That model needs adult mode (Settings).") }; return }
         val target = File(modelsDir, opt.fileName)
         if (target.isFile && target.length() == opt.sizeBytes) { loadModel(target); return }
         if (_ui.value.freeStorageBytes < opt.sizeBytes + 200L * 1024 * 1024 - (File(modelsDir, opt.fileName + ".part").length())) {
@@ -329,6 +367,13 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     conn.disconnect()
                     if (part.length() != opt.sizeBytes) throw IllegalStateException("Download incomplete (${part.length()} of ${opt.sizeBytes} bytes). Tap download again to resume.")
+                    opt.sha256?.let { want ->
+                        _ui.update { it.copy(screen = Screen.Busy("Checking the download...", null, "Verifying the file's checksum")) }
+                        if (!sha256(part).equals(want, ignoreCase = true)) {
+                            part.delete()
+                            throw IllegalStateException("The downloaded file failed its checksum check, so it was deleted. Please try again.")
+                        }
+                    }
                     if (!part.renameTo(target)) throw IllegalStateException("Could not finalize the model file")
                 }
                 refreshDevice()
@@ -396,6 +441,10 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
      * screen and into the model's context instead of a fresh greeting (Continue from History).
      */
     private fun loadModel(file: File, resume: List<ChatMessage>? = null) {
+        if (ModelCatalog.isAdultOnly(file.name) && !_ui.value.adultMode) {
+            _ui.update { it.copy(screen = Screen.Setup, error = "That model is only available in adult mode (Settings).") }
+            return
+        }
         workJob = viewModelScope.launch {
             val comp = _ui.value.companion
             _ui.update { it.copy(screen = Screen.Busy("Waking up ${comp.name}...", null, "Loading ${file.name} into memory")) }
@@ -405,14 +454,16 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
                     val st = withTimeoutOrNull(30_000) {
                         engine.state.first { it is InferenceEngine.State.Initialized || it.isModelReadyish() || it is InferenceEngine.State.Error }
                     } ?: throw IllegalStateException("The AI engine is busy (${engine.state.value.javaClass.simpleName})")
-                    if (st !is InferenceEngine.State.Initialized) engine.cleanUp()
+                    if (st !is InferenceEngine.State.Initialized) withContext(Dispatchers.IO) { engine.cleanUp() }
+                    // Marked until the model is up: if the app freezes or is killed while loading, startup won't retry it.
+                    prefs.edit().putString(PREF_PENDING, file.name).apply()
                     engine.loadModel(file.path)
                     val sys = fullSystemPrompt(comp)
                     if (resume == null) engine.setSystemPrompt(sys)
                     else engine.loadConversation(sys, contextTurns(resume, REBUILD_TOKEN_BUDGET))
                     chatValid = true
                 }
-                prefs.edit().putString("last_model_file", file.name).apply()
+                prefs.edit().putString("last_model_file", file.name).remove(PREF_PENDING).apply()
                 if (resume == null) {
                     saveConversation()
                     _ui.update {
@@ -429,15 +480,17 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
                 throw e
             } catch (e: Throwable) {
                 Log.e(TAG, "load failed", e)
-                runCatching { engine.cleanUp() }
-                _ui.update { it.copy(screen = Screen.Setup, error = "Could not load the model: ${e.message ?: e.javaClass.simpleName}") }
+                prefs.edit().remove(PREF_PENDING).apply()
+                withContext(NonCancellable + Dispatchers.IO) { runCatching { engine.cleanUp() } }
+                val heavyHint = if (file.length() >= ModelCatalog.HEAVY_BYTES) " This model may be too big for this phone; try a smaller one (Qwen2.5 1.5B or a 1B)." else ""
+                _ui.update { it.copy(screen = Screen.Setup, error = "Could not load the model: ${e.message ?: e.javaClass.simpleName}.$heavyHint") }
             }
         }
     }
 
     /** The persona plus the compact running-memory block (about 300 tokens at most). */
     private fun fullSystemPrompt(comp: CompanionProfile): String {
-        val base = comp.systemPrompt()
+        val base = comp.systemPrompt(_ui.value.adultMode)
         if (!_ui.value.memoryOn) return base
         val notes = runCatching { MemoryStore.load(getApplication(), comp.id) }.getOrDefault(emptyList())
         return base + MemoryStore.promptBlock(notes)
@@ -472,7 +525,7 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun reloadModelKeepingChat(msgs: List<ChatMessage>) {
         val name = _ui.value.loadedModelName ?: throw IllegalStateException("No model loaded")
         chatValid = false
-        runCatching { engine.cleanUp() }
+        withContext(Dispatchers.IO) { runCatching { engine.cleanUp() } }
         engine.loadModel(File(modelsDir, name).path)
         engine.loadConversation(fullSystemPrompt(_ui.value.companion), contextTurns(msgs, REBUILD_TOKEN_BUDGET))
         chatValid = true
@@ -510,7 +563,18 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
                 if (books != null) _ui.update { it.copy(notice = "\uD83D\uDCDA From the library: " + books.second.joinToString(", ")) }
                 val hidden = note ?: books?.first
                 val prompt = (if (hidden != null) "(App note, not said by the user: $hidden)\n\n$msg" else msg).take(MAX_PROMPT_CHARS)
-                llm.withLock { runTurn(prompt, userMsg.id, reply.id, sb, splitter, speakEpoch) }
+                llm.withLock {
+                    // 0.8.5: marked while replying, so a freeze / force-close mid-reply on a 3B model is caught at startup.
+                    val model = _ui.value.loadedModelName
+                    if (model != null) prefs.edit().putString(PREF_PENDING, model).apply()
+                    try {
+                        runTurn(prompt, userMsg.id, reply.id, sb, splitter, speakEpoch)
+                        if (model != null && sb.isNotEmpty() && File(modelsDir, model).length() >= ModelCatalog.HEAVY_BYTES)
+                            prefs.edit().putBoolean("heavy_ok_$model", true).apply()
+                    } finally {
+                        prefs.edit().remove(PREF_PENDING).apply()
+                    }
+                }
             } finally {
                 if ((_ui.value.autoSpeak || _ui.value.inCall) && speakEpoch == voice.currentEpoch()) splitter.flush()?.let { enqueueSpeech(it, speakEpoch) }
                 if (sb.isEmpty()) _ui.update { s -> s.copy(messages = s.messages.map { if (it.id == reply.id && it.text.isEmpty()) it.copy(text = NO_REPLY, aside = true) else it }) }
@@ -823,7 +887,8 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
                 engine.loadConversation(MemoryStore.EXTRACT_SYSTEM, emptyList())
                 var lines = p.lines
                 var prompt = MemoryStore.extractPrompt(p.companionName, lines, known)
-                while (lines.size > 2 && engine.countTokens(prompt) > MEMORY_PROMPT_TOKENS) {
+                val budget = if (heavyLoaded()) MEMORY_PROMPT_TOKENS_HEAVY else MEMORY_PROMPT_TOKENS
+                while (lines.size > 2 && engine.countTokens(prompt) > budget) {
                     lines = lines.drop(2)
                     prompt = MemoryStore.extractPrompt(p.companionName, lines, known)
                 }
@@ -1096,7 +1161,9 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
                     n to b
                 }
                 val d = withContext(Dispatchers.Default) { CharacterStore.parse(bytes, name) }
-                val notes = d.notes + if (d.adultFlagged) listOf("This looks like it was written for adult content. Adult content needs the upcoming 18+ mode, so for now the character is kept family-friendly by a safety rule.") else emptyList()
+                val notes = d.notes + if (d.adultFlagged) listOf(if (!Edition.UNLOCKED) "This looks like it was written for adult content. This edition keeps every character family-friendly with a safety rule."
+                    else if (_ui.value.adultMode) "This looks like it was written for adult content. Adult mode is on, so the family-friendly safety rule is lifted for this character."
+                    else "This looks like it was written for adult content. Unless 18+ adult mode is on (Settings), the character is kept family-friendly by a safety rule.") else emptyList()
                 _ui.update { it.copy(editor = CharacterEdit(id = null, name = d.name, look = d.look, personality = d.personality,
                     scenario = d.scenario, greeting = d.greeting, facts = d.facts.joinToString("\n"), adultFlagged = d.adultFlagged,
                     source = d.source, notes = listOf("Imported from: ${d.source} ($name)") + notes)) }
@@ -1127,7 +1194,7 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
             // Apply the voice now, and reload the AI if the personality changed.
             voice.speakerId = e.speakerId; _ui.update { it.copy(speakerId = e.speakerId) }
             if (e.voiceId != _ui.value.voiceId && VoiceCatalog.isInstalled(ctx, VoiceCatalog.byId(e.voiceId))) selectVoice(e.voiceId)
-            val changed = old == null || old.systemPrompt() != c.systemPrompt() || old.greeting != c.greeting
+            val changed = old == null || old.systemPrompt(_ui.value.adultMode) != c.systemPrompt(_ui.value.adultMode) || old.adultFlagged != c.adultFlagged || old.greeting != c.greeting
             if (changed && _ui.value.screen == Screen.Chat) { stop(); stopSpeaking(); _ui.value.loadedModelName?.let { loadModel(File(modelsDir, it)) } }
         }
     }
@@ -1536,17 +1603,153 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         capturePendingMemory()?.let { deferredMemory = it }
         memJob?.cancel()
         chatValid = false
-        runCatching { engine.cleanUp() }
+        // Off the main thread: unloading waits for the llama thread, which may still be finishing a reply.
+        viewModelScope.launch(Dispatchers.IO) { llm.withLock { runCatching { engine.cleanUp() } } }
         refreshDevice()
         saveConversation()
         _ui.update { it.copy(screen = Screen.Setup, loadedModelName = null, messages = emptyList()) }
         beginConversation(HistoryStore.MODE_CHAT, 0)
     }
 
+    // ---------- 0.8.4: 18+ adult mode ----------
+    private fun isDownloaded(o: ModelOption) = File(modelsDir, o.fileName).let { f -> f.isFile && f.length() == o.sizeBytes }
+
+    /** A downloaded regular (non-adult) model: the 1B first (0.8.5: the 3B froze on 6 GB), the 3B only on 7 GB+. */
+    private fun fallbackModelFile(): File? {
+        val ram = _ui.value.ramGb
+        return listOf(ModelCatalog.LLAMA_1B, ModelCatalog.LLAMA_3B)
+            .filter { it == ModelCatalog.LLAMA_1B || ram >= ModelCatalog.HEAVY_SAFE_RAM_GB }
+            .firstOrNull { isDownloaded(it) }
+            ?.let { File(modelsDir, it.fileName) }
+    }
+
+    /** A downloaded light model (adult picks first while adult mode is on), used when a heavy one froze. */
+    private fun lightModelFile(): File? {
+        val order = (if (_ui.value.adultMode) Edition.lightMatureModels else emptyList()) +
+            ModelCatalog.LLAMA_1B
+        return order.firstOrNull { isDownloaded(it) }?.let { File(modelsDir, it.fileName) }
+    }
+
+    /** True if [f] is a 3B-class model that shouldn't auto-load at startup on this phone right now. */
+    private fun heavyUnsafe(f: File): Boolean {
+        if (f.length() < ModelCatalog.HEAVY_BYTES) return false
+        if (prefs.getString(PREF_PENDING, null) == f.name) return true
+        return _ui.value.ramGb < ModelCatalog.HEAVY_SAFE_RAM_GB && !prefs.getBoolean("heavy_ok_${f.name}", false)
+    }
+
+    private fun heavyLoaded(): Boolean =
+        _ui.value.loadedModelName?.let { File(modelsDir, it).length() >= ModelCatalog.HEAVY_BYTES } == true
+
+    /** Turns adult mode on (the UI has already shown the disclaimer and the 18+ confirmation) or off. */
+    fun setAdultMode(on: Boolean) {
+        if (!Edition.UNLOCKED) return
+        if (on == _ui.value.adultMode) return
+        AdultMode.set(getApplication(), on)
+        _ui.update { it.copy(adultMode = on) }
+        refreshDevice()
+        refreshLibrary()
+        val loaded = _ui.value.loadedModelName
+        if (!on && ModelCatalog.isAdultOnly(loaded)) {
+            // The uncensored model is only for adult mode: switch to a regular one (this starts a new chat).
+            val fb = fallbackModelFile()
+            if (_ui.value.inCall) endCall()
+            if (fb == null) {
+                backToSetup()
+                _ui.update { it.copy(notice = "Adult mode is off, so the uncensored model was closed. Pick a regular model to keep chatting.") }
+                return
+            }
+            stop(); stopSpeaking()
+            val pending = capturePendingMemory()
+            loadModel(fb)
+            queueMemory(pending)
+            _ui.update { it.copy(notice = "Adult mode off. Switched to ${ModelCatalog.byFileName(fb.name)?.title ?: fb.name}.") }
+            return
+        }
+        if (!on && loaded == null && ModelCatalog.isAdultOnly(prefs.getString("last_model_file", null))) {
+            prefs.edit().remove("last_model_file").apply()
+        }
+        // An adult-flagged character's rules change: rebuild the model's context before the next reply.
+        val comp = _ui.value.companion
+        if (comp.custom && comp.adultFlagged && loaded != null) viewModelScope.launch { llm.withLock { chatValid = false } }
+        _ui.update { it.copy(notice = if (on) "Adult mode on (18+)" else "Adult mode off - family-friendly everywhere") }
+    }
+
     fun deleteModel(option: ModelOption) {
+        if (_ui.value.loadedModelName == option.fileName) { _ui.update { it.copy(error = "That model is in use. Go back to model setup first.") }; return }
         File(modelsDir, option.fileName).delete()
         File(modelsDir, option.fileName + ".part").delete()
+        val e = prefs.edit().remove("heavy_ok_${option.fileName}")
+        if (prefs.getString("last_model_file", null) == option.fileName) e.remove("last_model_file")
+        if (prefs.getString(PREF_PENDING, null) == option.fileName) e.remove(PREF_PENDING)
+        e.apply()
+        _ui.update { it.copy(notice = "Deleted ${option.title}") }
         refreshDevice()
+    }
+
+    // ---------- 0.8.6: in-app updates ----------
+    private var updateJob: Job? = null
+
+    fun setAutoUpdateCheck(on: Boolean) {
+        prefs.edit().putBoolean(PREF_UPDATE_AUTO, on).apply()
+        _ui.update { it.copy(update = it.update.copy(autoCheck = on)) }
+    }
+
+    /** Asks GitHub for a newer release of this edition. [manual] = the user tapped the button (show every result). */
+    fun checkForUpdates(manual: Boolean = true) {
+        if (_ui.value.update.checking || _ui.value.update.downloading) return
+        val app = getApplication<Application>()
+        _ui.update { it.copy(update = it.update.copy(checking = true, status = if (manual) "Checking GitHub..." else it.update.status)) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val now = System.currentTimeMillis()
+            try {
+                val info = Updater.check(app)
+                prefs.edit().putLong(PREF_UPDATE_LAST, now).apply()
+                _ui.update { it.copy(update = it.update.copy(checking = false, info = info, lastCheck = now,
+                    status = if (info == null) "You're up to date (${Updater.currentVersionName(app)})." else "Version ${info.versionName} is available.")) }
+                if (info != null && !manual) _ui.update { it.copy(notice = "Update available: ${info.versionName}. Settings > Updates") }
+            } catch (e: Throwable) {
+                Log.w(TAG, "update check failed", e)
+                _ui.update { it.copy(update = it.update.copy(checking = false,
+                    status = if (manual) "Couldn't check for updates: ${e.message ?: "no connection"}" else it.update.status)) }
+            }
+        }
+    }
+
+    fun downloadUpdate() {
+        val info = _ui.value.update.info ?: return
+        if (_ui.value.update.downloading) return
+        val app = getApplication<Application>()
+        _ui.update { it.copy(update = it.update.copy(downloading = true, progress = 0f, readyPath = null, status = "Downloading ${info.apk.name}...")) }
+        updateJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val f = Updater.download(app, info, isCancelled = { !isActive }) { p -> _ui.update { it.copy(update = it.update.copy(progress = p)) } }
+                _ui.update { it.copy(update = it.update.copy(downloading = false, progress = null, readyPath = f.path,
+                    status = "Downloaded and verified" + (if (info.apk.sha256 != null) " (checksum OK)" else "") + ". Tap Install.")) }
+                withContext(Dispatchers.Main) { installUpdate() }
+            } catch (e: Throwable) {
+                val cancelled = e is InterruptedException || e is kotlinx.coroutines.CancellationException
+                _ui.update { it.copy(update = it.update.copy(downloading = false, progress = null,
+                    status = if (cancelled) "Download cancelled." else "Update failed: ${e.message}")) }
+            }
+        }
+    }
+
+    fun cancelUpdateDownload() { updateJob?.cancel(); updateJob = null }
+
+    /** Starts Android's installer, or first sends the user to "Install unknown apps" for this app. */
+    fun installUpdate() {
+        val app = getApplication<Application>()
+        val path = _ui.value.update.readyPath ?: return
+        val f = File(path)
+        if (!f.isFile) { _ui.update { it.copy(update = it.update.copy(readyPath = null, status = "The download is gone. Check again.")) }; return }
+        if (!Updater.canInstall(app)) {
+            _ui.update { it.copy(update = it.update.copy(needsPermission = true,
+                status = "Android needs your OK first: turn on \"Allow from this source\" for Aurora, then come back and tap Install.")) }
+            Updater.openInstallPermission(app)
+            return
+        }
+        _ui.update { it.copy(update = it.update.copy(needsPermission = false, status = "Opening the installer... Tap Update. Your chats and settings are kept.")) }
+        runCatching { Updater.install(app, f) }.onFailure { e -> _ui.update { it.copy(update = it.update.copy(status = "Couldn't open the installer: ${e.message}")) } }
     }
 
     override fun onCleared() {
@@ -1569,6 +1772,13 @@ class AuroraViewModel(app: Application) : AndroidViewModel(app) {
         private const val MAX_PROMPT_CHARS = 6000
         private const val MEMORY_MAX_LINES = 40
         private const val MEMORY_PROMPT_TOKENS = 2200
+        /** 3B-class models prefill slowly on phones: a shorter memory pass so the next reply isn't held up. */
+        private const val MEMORY_PROMPT_TOKENS_HEAVY = 900
+        /** Set while a model is loading or replying; still set at startup = it froze or was force-closed. */
+        private const val PREF_PENDING = "model_pending"
+        private const val PREF_UPDATE_AUTO = "update_autocheck"
+        private const val PREF_UPDATE_LAST = "update_last_check"
+        private const val UPDATE_CHECK_INTERVAL_MS = 24L * 60 * 60 * 1000
         private const val MEMORY_REPLY_TOKENS = 200
         const val NO_REPLY = "(no reply)"
         const val BOOK_KNOWLEDGE_MIN_RAM_GB = 6.0

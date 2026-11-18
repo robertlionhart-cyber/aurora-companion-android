@@ -1,8 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Used ONLY for the optional, user-approved model download. Chat itself is fully offline. -->
+    <!-- Used ONLY for optional downloads the user starts (models, voices, books) and for update checks
+         (Settings > Updates; optional once-a-day check). Chat itself is fully offline. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 0.8.6: lets the in-app updater hand a downloaded, verified update to Android's installer (the user confirms). -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- Push-to-talk. Audio is transcribed on the device and never uploaded. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Call mode: switch to communication audio (echo cancellation, loudspeaker routing). -->

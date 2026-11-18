@@ -456,6 +456,8 @@ fun SettingsScreen(ui: UiState, vm: AuroraViewModel, sizing: Sizing, onClose: ()
                    onReminders: () -> Unit, onLibrary: () -> Unit, onHistory: () -> Unit, onMemory: () -> Unit) {
     androidx.activity.compose.BackHandler(onBack = onClose)
     var agreed by remember { mutableStateOf(false) }
+    var askAdult by remember { mutableStateOf(false) }
+    if (askAdult) AdultModeDialog(onConfirm = { askAdult = false; vm.setAdultMode(true) }, onDismiss = { askAdult = false })
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
         Column(Modifier.widthIn(max = 760.dp).fillMaxSize()) {
             Row(Modifier.fillMaxWidth().padding(start = sizing.pad, end = 4.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -575,6 +577,17 @@ fun SettingsScreen(ui: UiState, vm: AuroraViewModel, sizing: Sizing, onClose: ()
                 SectionTitle("AI model")
                 Hint("Model: ${ui.loadedModelName ?: "-"}  -  RAM %.1f GB".format(ui.ramGb))
                 OutlinedButton(onClick = { onClose(); vm.backToSetup() }) { Text("Change AI model") }
+                if (com.aurora.companion.android.Edition.UNLOCKED) {
+                    HorizontalDivider(Modifier.padding(vertical = 4.dp))
+                    SectionTitle("Adult content")
+                    SettingRow("\uD83D\uDD1E Adult mode (18+)", if (ui.adultMode)
+                            "On. Adult-marked characters, the adult book and the uncensored models are available. Turn off any time."
+                        else "Off (family-friendly). For adults only; asks you to confirm your age.") {
+                        Switch(checked = ui.adultMode, onCheckedChange = { if (it) askAdult = true else vm.setAdultMode(false) })
+                    }
+                }
+                HorizontalDivider(Modifier.padding(vertical = 4.dp))
+                UpdatesSection(ui, vm)
                 Spacer(Modifier.height(24.dp))
             }
         }
@@ -608,5 +621,66 @@ fun CompanionBackdrop(companion: CompanionProfile, state: String, animate: Boole
             androidx.compose.foundation.Image(it, contentDescription = companion.name, contentScale = ContentScale.FillBounds, modifier = frame)
         }
         if (animate) AvatarClipPublic(companion.clip(state), frame)
+    }
+}
+
+/** 0.8.4: the 18+ confirmation (disclaimer + "I am 18 or older" checkbox) shown before adult mode turns on. */
+@Composable
+fun AdultModeDialog(onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    var sure by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(com.aurora.companion.android.AdultMode.TITLE) },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(com.aurora.companion.android.AdultMode.DISCLAIMER, fontSize = 14.sp)
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { sure = !sure }) {
+                    Checkbox(checked = sure, onCheckedChange = { sure = it })
+                    Text(com.aurora.companion.android.AdultMode.CONFIRM, fontSize = 14.sp)
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onConfirm, enabled = sure) { Text("Turn on") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+/** 0.8.6: Settings > Updates (GitHub Releases, started by the user; optional once-a-day check). */
+@Composable
+private fun UpdatesSection(ui: UiState, vm: AuroraViewModel) {
+    val u = ui.update
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val current = remember { com.aurora.companion.android.Updater.currentVersionName(ctx) }
+    SectionTitle("Updates")
+    Hint("${com.aurora.companion.android.Edition.NAME} edition, version $current. Updates install over this app and keep your chats, " +
+        "characters and settings. The internet is only used when you check or download.")
+    SettingRow("Check once a day", "Quietly looks for a new version when the app opens (at most once a day).") {
+        Switch(checked = u.autoCheck, onCheckedChange = { vm.setAutoUpdateCheck(it) })
+    }
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        OutlinedButton(onClick = { vm.checkForUpdates(true) }, enabled = !u.checking && !u.downloading) {
+            Text(if (u.checking) "Checking..." else "Check for updates")
+        }
+        val info = u.info
+        if (info != null && u.readyPath == null && !u.downloading)
+            Button(onClick = vm::downloadUpdate) { Text("Download ${info.versionName} (${info.apk.size.toNiceSize()})") }
+        if (u.readyPath != null) Button(onClick = vm::installUpdate) { Text("Install") }
+    }
+    val p = u.progress
+    if (u.downloading) {
+        if (p != null) LinearProgressIndicator(progress = { p.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+        else LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(if (p != null) "${(p * 100).toInt()}%  - Wi-Fi recommended" else "Downloading...", fontSize = 12.sp, modifier = Modifier.weight(1f))
+            TextButton(onClick = vm::cancelUpdateDownload) { Text("Cancel") }
+        }
+    }
+    u.status?.let { Text(it, fontSize = 12.sp, color = AuroraTeal) }
+    if (u.needsPermission) OutlinedButton(onClick = vm::installUpdate) { Text("I allowed it - Install") }
+    u.info?.let { info ->
+        Text(info.title, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+        val notes = info.notes.lines().filter { it.isNotBlank() }.take(14).joinToString("\n")
+        if (notes.isNotBlank()) Text(notes, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Hint(if (info.apk.sha256 != null) "Checksum published: it is verified after download." else "No checksum published: size and signature are still checked.")
     }
 }

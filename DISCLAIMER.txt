@@ -43,10 +43,14 @@ Please read this before installing and using the app.
 3. Offline and private
    Everything runs on your device. There is no account, no cloud service,
    no ads and no telemetry. The only internet use is the optional downloads
-   above, when you tap them.
+   above, when you tap them, and update checks (Settings > Updates), which
+   ask GitHub for the newest release when you tap "Check for updates" or,
+   if you leave it on, once a day when the app opens. Updates are only
+   installed after you confirm them in Android's installer.
 
-4. Adult mode
-   This beta is family-friendly. There is no 18+ mode in this version.
+4. Family edition
+   This Family edition is family-friendly. Imported characters written for
+   mature content are kept family-friendly by a safety rule.
 
 5. Your data and your device
    Chats, conversation history, memory notes, characters, reminders and downloads are saved

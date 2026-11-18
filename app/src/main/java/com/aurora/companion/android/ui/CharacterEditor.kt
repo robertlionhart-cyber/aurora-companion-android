@@ -41,6 +41,7 @@ fun CharacterEditor(ui: UiState, vm: AuroraViewModel, sizing: Sizing, start: Cha
     var voiceId by remember(start) { mutableStateOf(start.voiceId) }
     var speaker by remember(start) { mutableStateOf(start.speakerId.coerceIn(0, LIBRITTS_SPEAKERS - 1)) }
     var confirmDelete by remember { mutableStateOf(false) }
+    var adult by remember(start) { mutableStateOf(start.adultFlagged) }
     androidx.activity.compose.BackHandler(onBack = vm::closeEditor)
     val isNew = start.id == null
     val canSave = name.isNotBlank() && personality.trim().length >= 10
@@ -61,13 +62,22 @@ fun CharacterEditor(ui: UiState, vm: AuroraViewModel, sizing: Sizing, start: Cha
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Text(if (isNew) "New character" else "Edit character", fontSize = (sizing.body + 7).sp, fontWeight = FontWeight.Bold)
-            // Family-friendly notice (no 18+ mode yet)
+            // Family-friendly notice; adult characters only lose the safety rule while 18+ adult mode is on (0.8.4).
             Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(PanelHi).padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text("Family-friendly for now", fontWeight = FontWeight.SemiBold, color = AuroraTeal, fontSize = 14.sp)
-                Text("Every custom or imported character gets a safety rule that keeps replies age-appropriate. " +
-                    "Adult content needs the upcoming 18+ mode.", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                if (start.adultFlagged) Text("This one looks like it was written for adult content, so it will be kept family-friendly.",
+                Text(if (ui.adultMode && adult) "Adult character (18+)" else "Family-friendly", fontWeight = FontWeight.SemiBold,
+                    color = if (ui.adultMode && adult) AuroraPink else AuroraTeal, fontSize = 14.sp)
+                Text(if (ui.adultMode) "Adult mode is on. Characters marked as adult can talk about mature themes; all others keep " +
+                        "a safety rule that keeps replies age-appropriate."
+                    else if (!com.aurora.companion.android.Edition.UNLOCKED) "Every custom or imported character gets a safety rule that keeps replies age-appropriate."
+                    else "Every custom or imported character gets a safety rule that keeps replies age-appropriate. " +
+                        "Adult content needs 18+ adult mode (Settings).", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (adult && !ui.adultMode) Text(if (com.aurora.companion.android.Edition.UNLOCKED) "This one is marked as adult content, so it will be kept family-friendly while adult mode is off."
+                    else "This one looks like it was written for adult content; it is kept family-friendly.",
                     fontSize = 12.sp, color = AuroraPink)
+                if (ui.adultMode) Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Adult character (18+)", fontSize = 14.sp, modifier = Modifier.weight(1f))
+                    Switch(checked = adult, onCheckedChange = { adult = it })
+                }
                 start.notes.forEach { Text("- $it", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             }
 
@@ -124,7 +134,7 @@ fun CharacterEditor(ui: UiState, vm: AuroraViewModel, sizing: Sizing, start: Cha
             FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
                 Button(enabled = canSave, modifier = Modifier.heightIn(min = 50.dp), onClick = {
                     vm.saveCharacter(start.copy(name = name.trim(), look = look, personality = personality, scenario = scenario,
-                        greeting = greeting, facts = facts, voiceId = voiceId, speakerId = speaker))
+                        greeting = greeting, facts = facts, voiceId = voiceId, speakerId = speaker, adultFlagged = adult))
                 }) { Text(if (isNew) "Save character" else "Save changes") }
                 OutlinedButton(onClick = vm::closeEditor, modifier = Modifier.heightIn(min = 50.dp)) { Text("Cancel") }
             }

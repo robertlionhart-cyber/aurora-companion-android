@@ -35,12 +35,28 @@ android {
         applicationId = "com.aurora.companion.android"
         minSdk = 26          // Android 8.0+ : covers Xiaomi Pad 5 and Galaxy A54 easily
         targetSdk = 36
-        versionCode = 13
-        versionName = "0.8.3-beta"
+        versionCode = 16
+        versionName = "0.8.6-beta"
 
         ndk {
             // Pad 5 (Snapdragon 860) and Galaxy A54 (Exynos 1380) are both 64-bit ARM.
             abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    // 0.8.6: two editions from one code base, both signed with the same release key.
+    //  family   - no 18+ mode at all; keeps the ORIGINAL applicationId, so 0.8.2-0.8.5 installs update into it in place.
+    //  unlocked - adds the optional 18+ mode (off by default); its own applicationId (.unlocked) so both can be installed.
+    // Edition-specific code lives in src/family and src/unlocked (Edition.kt).
+    flavorDimensions += "edition"
+    productFlavors {
+        create("family") {
+            dimension = "edition"
+        }
+        // Only when its source set is present (the public repo may ship the Family edition alone).
+        if (file("src/unlocked").exists()) create("unlocked") {
+            dimension = "edition"
+            applicationIdSuffix = ".unlocked"
         }
     }
 
