@@ -63,6 +63,9 @@ Your chats, characters and downloads are kept. (Older versions: install the new 
   animation. Big, simple controls made for kids: play/pause, back/forward (tap = a sentence, hold = a paragraph),
   chapters, speed and a **bedtime timer** (15/30/45/60 minutes or end of chapter). Keeps going with the screen off,
   with lock-screen and headphone controls, pauses for calls, and remembers your place in every book
+- **Animal sounds (new in 1.0.1)**: Leo the cat meows and Barry the dog woofs right before they talk (a little quieter
+  than the voice, a different sound each time). Switch it off in **Settings > Voice & calls > Animal sounds before
+  talking**. Book read-aloud is never interrupted by it
 - **Find a book (new in 1.0)**: search Project Gutenberg's free public-domain books (via Gutendex, no account) and add
   them to your Library. Needs Online mode; added books work offline. The Family edition hides books whose subjects
   are adult or erotic
@@ -148,3 +151,7 @@ zip files with a manifest; the app only accepts a pack whose SHA-256 matches the
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). `en_US-robert-medium` is Robert's own voice
 model, included for personal use with Aurora Companion only. Do not redistribute it or use it to
 impersonate him.
+
+The animal sounds are short excerpts of free recordings: Joseph SARDIN / [BigSoundBank](https://bigsoundbank.com)
+(CC0) and Wikimedia Commons recordings by Tsester (CC0) and Heismark (public domain); details in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and `app/src/main/assets/sounds/CREDITS.txt`.
