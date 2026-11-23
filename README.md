@@ -63,6 +63,11 @@ Your chats, characters and downloads are kept. (Older versions: install the new 
   animation. Big, simple controls made for kids: play/pause, back/forward (tap = a sentence, hold = a paragraph),
   chapters, speed and a **bedtime timer** (15/30/45/60 minutes or end of chapter). Keeps going with the screen off,
   with lock-screen and headphone controls, pauses for calls, and remembers your place in every book
+- **Reading on the chat screen (new in 1.0.2)**: when a book starts, you're taken to the chat screen and the book
+  controls sit right under your companion, who talks while reading and rests when paused. **▼** shrinks the
+  controls to a small bar (chat comes back), **✕ Close** stops the book (your place is saved) and returns to normal
+  chat. Near the end of the bedtime timer your companion calms down, and when the story stops it falls asleep (looks
+  with a sleeping animation). The lock-screen controls show your companion's picture
 - **Animal sounds (new in 1.0.1)**: Leo the cat meows and Barry the dog woofs right before they talk (a little quieter
   than the voice, a different sound each time). Switch it off in **Settings > Voice & calls > Animal sounds before
   talking**. Book read-aloud is never interrupted by it
